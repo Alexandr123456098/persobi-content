@@ -1,10 +1,15 @@
 {
-  "snapshot_at": "2025-11-09_000013",
+  "snapshot_at": "2025-11-12_042729",
   "host": "5238725-lq74514",
   "project": "persobi",
-  "unit": "persobi.service",
-  "service_status": "inactive",
+  "unit": "content-factory.service",
+  "service_status": "active",
   "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/persobi-content.git", "dirty": "clean" },
-  "system": { "disk_root": "34% used of 69G", "mem_used": "1.9Gi/5.8Gi" },
-  "cluster": {"at":"2025-11-09T00:00:13+03:00","host":"5238725-lq74514","rows":[{"name":"jurist","path":"/root/projects/jurist","unit":"jurist.service","status":"active","branch":"-","origin":"-","dirty":"-"},{"name":"persobi","path":"/root/projects/persobi-content","unit":"persobi.service","status":"inactive","branch":"-","origin":"-","dirty":"-"},{"name":"deniska","path":"/root/projects/deniska-dashboard","unit":"deniska-dashboard.service","status":"active","branch":"-","origin":"-","dirty":"-"},{"name":"testbot","path":"/root/projects/testbot","unit":"testbot.service","status":"inactive","branch":"-","origin":"-","dirty":"-"}]}
+  "system": { "disk_root": "36% used of 69G", "mem_used": "1.9Gi/5.8Gi" },
+  "cluster": { "rows": [
+  {"name":"deniska","unit":"deniska-dashboard.service","path":"/root/projects/deniska-dashboard","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/deniska-dashboard.git","dirty":"clean","uptime":"824"},
+  {"name":"persobi-content","unit":"content-factory.service","path":"/opt/content_factory","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/persobi-content.git","dirty":"clean","uptime":"9948"},
+  {"name":"antishtraf","unit":"antishtraf.service","path":"/root/projects/antishtraf","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/antishtraf.git","dirty":"clean","uptime":"14352"},
+  {"name":"jurist","unit":"jurist.service","path":"/root/projects/jurist","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/jurist-autosave.git","dirty":"clean","uptime":"350552"}
+]}
 }
