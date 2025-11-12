@@ -1,0 +1,203 @@
+import os, shlex, asyncio, time
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from dotenv import load_dotenv
+
+# === ENV ===
+load_dotenv(dotenv_path=os.path.join("/opt/content_factory", ".env"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OUT_DIR = os.getenv("OUT_DIR", "/opt/content_factory/out")
+PROVIDERS = [p.strip() for p in os.getenv("PROVIDERS", "replicate,offline").split(",") if p.strip()]
+USE_LUMA_4K = os.getenv("USE_LUMA_4K", "0") in ("1", "true", "yes")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+# Клиенты провайдеров (ленивый импорт)
+_clients = {}
+def _get_client(name: str):
+    name = name.lower()
+    if name in _clients:
+        return _clients[name]
+    if name == "replicate":
+        from app.adapters.replicate_adapter import ReplicateClient
+        _clients[name] = ReplicateClient(OUT_DIR)
+        return _clients[name]
+    if name in ("offline", "ffmpeg"):
+        from app.adapters.offline_adapter import OfflineClient
+        _clients[name] = OfflineClient(OUT_DIR)
+        return _clients[name]
+    raise RuntimeError(f"Неизвестный провайдер: {name}")
+
+# Постпроц (локальный TTS/апскейл)
+from app.utils.media import upscale_4k  # TTS подключим позже по желанию
+
+HELP_TEXT = (
+    "👋 Добро пожаловать в Persobi Content Combine!\n\n"
+    "Напиши идею — я соберу режиссёрский промпт и сделаю видео.\n"
+    "Примеры:\n"
+    "• сделай реалистичное видео, где бабушка вяжет носки\n"
+    "• реклама кроссовок найк, динамичная, 5 секунд\n\n"
+    "Команда для технарей (не обязательно): /video <текст> [--4k]\n"
+    f"Провайдеры сейчас: {', '.join(PROVIDERS)}\n"
+)
+
+def build_director_prompt(user_text: str) -> str:
+    """
+    Простой «режиссёрский промпт»: аккуратно структурируем идею пользователя.
+    Это MVP-версия: без магии, но стабильно.
+    """
+    t = (user_text or "").strip()
+    return (
+        f"{t}\n"
+        "Style: cinematic, natural lighting, realistic motion, steady camera.\n"
+        "Framing: varied shots, close-ups and medium shots, tasteful composition.\n"
+        "Motion: smooth 24–30fps, slight camera movement, minimal jitter.\n"
+        "Quality: coherent, detailed, pleasing color grading.\n"
+        "Duration: ~5s.\n"
+    )
+
+async def _show_spinner(message: types.Message, prefix: str, stop_event: asyncio.Event):
+    dots = ["", ".", "..", "..."]
+    i = 0
+    status_msg = await message.reply(f"{prefix} …")
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(1.2)
+            await status_msg.edit_text(f"{prefix} {dots[i%4]}")
+            i += 1
+    finally:
+        # тихо завершим; не трогаем текст (его перепишет вызывающая логика)
+        pass
+    return status_msg
+
+async def _generate_with_fallback(prompt: str, progress_msg: types.Message):
+    last_err = None
+    for provider in PROVIDERS:
+        try:
+            await progress_msg.edit_text(f"🛠 {provider}: генерирую…")
+            client = _get_client(provider)
+            loop = asyncio.get_event_loop()
+            path = await loop.run_in_executor(None, client.generate, prompt)
+            await progress_msg.edit_text(f"✅ {provider}: готово")
+            return provider, path
+        except Exception as e:
+            last_err = e
+            await progress_msg.edit_text(f"⚠️ {provider}: {e}")
+            await asyncio.sleep(0.8)
+    raise last_err if last_err else RuntimeError("Не удалось сгенерировать ролик")
+
+# Храним последний результат на пользователя, чтобы кнопка 4K знала, что апскейлить
+_last_video_by_user = {}  # user_id -> {"path": str, "prompt": str}
+
+def _make_actions_keyboard():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔁 4K", callback_data="do_4k"))
+    return kb
+
+@dp.message_handler(commands=["start"])
+async def start_cmd(m: types.Message):
+    await m.reply(HELP_TEXT)
+
+@dp.message_handler(commands=["health"])
+async def health_cmd(m: types.Message):
+    rep_token = "set" if os.getenv("REPLICATE_API_TOKEN") else "unset"
+    model = os.getenv("REPLICATE_MODEL", "tencent/hunyuan-video")
+    version = os.getenv("REPLICATE_MODEL_VERSION", "")[:12] + "..." if os.getenv("REPLICATE_MODEL_VERSION") else "(auto)"
+    txt = (
+        "Health:\n"
+        f"- OUT_DIR: {OUT_DIR}\n"
+        f"- PROVIDERS: {', '.join(PROVIDERS)}\n"
+        f"- Replicate token: {rep_token}\n"
+        f"- Replicate model (slug): {model}\n"
+        f"- Replicate version: {version}\n"
+        f"- 4K через Luma: {'ON' if USE_LUMA_4K else 'OFF (локальный апскейл)'}\n"
+    )
+    await m.reply(txt)
+
+def _parse_video_args(text: str):
+    parts = shlex.split(text or "")
+    if parts and parts[0].startswith("/video"):
+        parts = parts[1:]
+    flags = set(p for p in parts if p.startswith("--"))
+    prompt_text = " ".join(p for p in parts if not p.startswith("--")).strip()
+    want_4k = "--4k" in flags
+    return prompt_text, want_4k
+
+async def _handle_generation(m: types.Message, user_text: str, force_4k: bool = False):
+    # 1) «режиссёрский промпт»
+    director_prompt = build_director_prompt(user_text)
+    await m.reply(f"🎬 Режиссёрский промпт:\n```\n{director_prompt}\n```", parse_mode="Markdown")
+
+    # 2) спиннер прогресса
+    stop_event = asyncio.Event()
+    spinner_task = asyncio.create_task(_show_spinner(m, "🎥 Делаю видео", stop_event))
+
+    try:
+        # 3) генерация видео
+        provider, video_path = await _generate_with_fallback(director_prompt, m)
+    finally:
+        stop_event.set()
+        await asyncio.sleep(0.1)
+
+    # 4) отправка видео + кнопки
+    await m.reply_video(open(video_path, "rb"), caption=f"{provider} ✅", reply_markup=_make_actions_keyboard())
+    _last_video_by_user[m.from_user.id] = {"path": video_path, "prompt": director_prompt}
+
+    # 5) опционально сразу 4K (если просили флагом)
+    if force_4k:
+        await _do_4k_flow(m)
+
+@dp.message_handler(commands=["video"])
+async def video_cmd(m: types.Message):
+    text, want_4k = _parse_video_args(m.text or "")
+    if not text:
+        await m.reply("Нужно так: /video <текст> [--4k]\nИли просто напиши идею сообщением.")
+        return
+    await _handle_generation(m, text, force_4k=want_4k)
+
+@dp.message_handler(content_types=["text"])
+async def free_text_cmd(m: types.Message):
+    # Свободная форма: пользователь просто пишет идею
+    text = (m.text or "").strip()
+    if not text:
+        return
+    await _handle_generation(m, text, force_4k=False)
+
+async def _do_4k_flow(m: types.Message):
+    info = _last_video_by_user.get(m.from_user.id)
+    if not info:
+        await m.reply("Не вижу последнего видео. Отправь новую идею текстом, и я сделаю 4K после.")
+        return
+
+    src_path = info["path"]
+    # Плашка статуса
+    msg = await m.reply("🧩 Делаю 4K апскейл…")
+    try:
+        if USE_LUMA_4K:
+            # TODO: сюда позже подключим Luma-клиент (интерфейс кнопки останется тем же)
+            raise RuntimeError("Luma не подключена в этом MVP. Используй локальный апскейл (USE_LUMA_4K=0).")
+        else:
+            loop = asyncio.get_event_loop()
+            up4k = await loop.run_in_executor(None, upscale_4k, src_path, OUT_DIR)
+            await msg.edit_text("✅ 4K апскейл готов")
+            await m.reply_video(open(up4k, "rb"), caption="Локальный 4K ✅")
+            _last_video_by_user[m.from_user.id]["path"] = up4k
+    except Exception as e:
+        await msg.edit_text(f"⚠️ 4K не удался: {e}")
+
+@dp.callback_query_handler(lambda c: c.data == "do_4k")
+async def cb_do_4k(c: types.CallbackQuery):
+    await c.answer("Запускаю 4K…")
+    await _do_4k_flow(c.message)
+
+def main():
+    executor.start_polling(dp, skip_updates=True)
+
+if __name__ == "__main__":
+    main()

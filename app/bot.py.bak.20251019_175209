@@ -1,0 +1,139 @@
+# /opt/content_factory/app/bot.py
+# -*- coding: utf-8 -*-
+import os, asyncio, logging
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+
+from adapters.luma_adapter import render_4k
+from adapters.tts_adapter import voiceover_video
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+OUT_DIR = os.getenv("OUT_DIR", "/opt/content_factory/out").strip()
+
+# Твои функции, которые уже есть (заглушки тут для контекста):
+# - wan_t2v(prompt, out_dir) -> str|None
+# - wan_i2v(image_url, prompt, out_dir) -> str|None
+from app.adapters.wan_adapter import wan_t2v, wan_i2v  # если у тебя другой путь — поправь импорт
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+# состояния на чат
+last_prompt: dict[int, str] = {}
+last_director_prompt: dict[int, str] = {}
+last_video_path: dict[int, str] = {}
+
+# Заглушка генерации «режиссёрского промпта».
+# Если нет OPENAI_API_KEY — просто возвращаем входной текст.
+def make_director_prompt(text: str) -> str:
+    return text
+
+def _kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔁 Сделать 4K в Luma", callback_data="upscale_luma"),
+                InlineKeyboardButton(text="🔊 Озвучить", callback_data="voiceover")
+            ]
+        ]
+    )
+
+async def _tg_file_url(bot: Bot, file_id: str) -> str:
+    f = await bot.get_file(file_id)
+    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+
+@dp.message(Command("start"))
+async def on_start(m: Message):
+    await m.answer("Я соберу режиссёрский промпт и сделаю черновик. Напиши идею или пришли фото.")
+
+@dp.message(F.photo)
+async def on_photo(m: Message):
+    chat_id = m.chat.id
+    prompt = last_prompt.get(chat_id, "аккуратное движение камеры")
+    director = make_director_prompt(prompt)
+    last_director_prompt[chat_id] = director
+
+    file_id = m.photo[-1].file_id
+    img_url = await _tg_file_url(bot, file_id)
+
+    await m.answer("Делаю черновик (WAN i2v)…")
+    fp = await wan_i2v(img_url, director, OUT_DIR)
+    if not fp:
+        await m.answer("Не удалось сгенерировать видео в WAN i2v. Попробуй другое фото/текст.")
+        return
+
+    last_video_path[chat_id] = fp
+    caption = "Черновик\n\n🎬 Промпт:\n" + director
+    await m.answer_video(video=FSInputFile(fp), caption=caption, reply_markup=_kb())
+
+@dp.message(F.text.len() > 0)
+async def on_text(m: Message):
+    chat_id = m.chat.id
+    text = m.text.strip()
+    last_prompt[chat_id] = text
+    director = make_director_prompt(text)
+    last_director_prompt[chat_id] = director
+
+    await m.answer("Окей. Рендерю одно видео (WAN t2v)…")
+    fp = await wan_t2v(director, OUT_DIR)
+    if not fp:
+        await m.answer("Не удалось сделать черновик в WAN t2v. Попробуй упростить промпт или пришли фото.")
+        return
+
+    last_video_path[chat_id] = fp
+    caption = "Черновик\n\n🎬 Промпт:\n" + director
+    await m.answer_video(video=FSInputFile(fp), caption=caption, reply_markup=_kb())
+
+@dp.message(Command("prompt"))
+async def cmd_prompt(m: Message):
+    p = last_director_prompt.get(m.chat.id)
+    if not p:
+        await m.answer("Промпт пока пуст. Сначала сгенерируй черновик.")
+        return
+    await m.answer(f"🎬 Текущий промпт:\n{p}")
+
+@dp.callback_query(F.data == "upscale_luma")
+async def on_upscale(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    p = last_director_prompt.get(chat_id)
+    if not p:
+        await cb.answer("Нет промпта для Luma", show_alert=True); return
+    await cb.answer("Запускаю Luma 4K…")
+    await cb.message.answer("Премиум-рендер в Luma 4K. Жду результат…")
+    url = await asyncio.to_thread(render_4k, p, "16:9")
+    if not url:
+        await cb.message.answer("Не удалось запустить/дождаться Luma 4K. Проверь ключ и баланс.")
+        return
+    # Telegram принимает HTTP URL на mp4 напрямую
+    await cb.message.answer_video(video=url, caption="Luma 4K ✅")
+
+@dp.callback_query(F.data == "voiceover")
+async def on_voiceover(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    fp = last_video_path.get(chat_id)
+    p = last_director_prompt.get(chat_id)
+    if not fp or not p:
+        await cb.answer("Нечего озвучивать. Сначала сделай черновик.", show_alert=True); return
+    await cb.answer("Делаю озвучку…")
+    await cb.message.answer("Синтез голоса и склейка…")
+    try:
+        out_fp = await asyncio.to_thread(voiceover_video, fp, p)
+    except Exception as e:
+        await cb.message.answer(f"Озвучка не удалась: {e}")
+        return
+    await cb.message.answer_video(video=FSInputFile(out_fp), caption="Озвученная версия ✅")
+
+async def main():
+    log.info(f"ENV: BOT_TOKEN={'set' if BOT_TOKEN else 'EMPTY'}, REPLICATE={'set' if REPLICATE_API_TOKEN else 'EMPTY'}")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot stopped")

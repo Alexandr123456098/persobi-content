@@ -1,0 +1,282 @@
+# /opt/content_factory/app/bot.py
+# -*- coding: utf-8 -*-
+import os
+import asyncio
+import time
+import logging
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple
+
+import requests
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+
+# ---- Luma adapter ----
+LUMA_AVAILABLE = False
+try:
+    from app.adapters.luma_adapter import luma_generate_4k  # sync function
+    LUMA_AVAILABLE = True
+except Exception:
+    LUMA_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
+
+# ---------- ENV ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+OUT_DIR = os.getenv("OUT_DIR", "/opt/content_factory/out").strip() or "/opt/content_factory/out"
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# OpenAI для режиссёрского промпта (не связан с Sora)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+# WAN t2v / i2v
+WAN_MODEL_NAME = os.getenv("WAN_MODEL_NAME", "tencent/hunyuan-video").strip()
+WAN_MODEL_VERSION = os.getenv("WAN_MODEL_VERSION", "").strip()
+WAN_I2V_MODEL_NAME = os.getenv("WAN_I2V_MODEL_NAME", "wan-video/wan-2.2-i2v-fast").strip()
+WAN_I2V_MODEL_VERSION = os.getenv("WAN_I2V_MODEL_VERSION", "b609b267d986d762a6d8679ac036d29e6d4454218df558db3aa4d0396ba55c59").strip()
+
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "24"))
+VIDEO_DURATION = int(os.getenv("VIDEO_DURATION", "6"))
+
+# Luma активна, если есть ключ/база + импорт адаптера прошёл
+LUMA_ENABLED = bool(os.getenv("LUMA_API_KEY") and os.getenv("LUMA_BASE_URL") and LUMA_AVAILABLE)
+
+# Память последних промптов по чатам
+last_prompt: Dict[int, str] = {}
+
+# ---------- helpers ----------
+def _replicate_headers():
+    return {"Authorization": f"Token {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
+
+def _replicate_latest(model: str) -> Optional[str]:
+    try:
+        r = requests.get(f"https://api.replicate.com/v1/models/{model}", headers=_replicate_headers(), timeout=30)
+        r.raise_for_status()
+        return r.json().get("latest_version", {}).get("id")
+    except Exception as e:
+        log.error(f"latest_version[{model}] error: {e}")
+        return None
+
+def _replicate_predict(version: str, inputs: dict) -> Tuple[Optional[str], dict]:
+    try:
+        r = requests.post("https://api.replicate.com/v1/predictions",
+                          headers=_replicate_headers(), json={"version": version, "input": inputs}, timeout=60)
+        j = r.json()
+        if r.status_code >= 400:
+            log.error(f"predict {r.status_code}: {j}")
+            return None, j
+        return j.get("id"), j
+    except Exception as e:
+        return None, {"error": str(e)}
+
+def _replicate_wait(pred_id: str, poll: float = 3.0, timeout_s: int = 180) -> dict:
+    url = f"https://api.replicate.com/v1/predictions/{pred_id}"
+    t0 = time.time()
+    while True:
+        r = requests.get(url, headers=_replicate_headers(), timeout=30)
+        j = r.json()
+        st = j.get("status")
+        log.info(f"replicate[{pred_id}] status={st}")
+        if st in {"succeeded", "failed", "canceled"}:
+            return j
+        if time.time() - t0 > timeout_s:
+            j["error"] = "timeout"
+            return j
+        time.sleep(poll)
+
+def _download(url: str, out_dir: str, prefix: str) -> str:
+    r = requests.get(url, stream=True, timeout=300)
+    r.raise_for_status()
+    fn = f"{prefix}{os.urandom(5).hex()}.mp4"
+    fp = str(Path(out_dir) / fn)
+    with open(fp, "wb") as f:
+        for chunk in r.iter_content(8192):
+            if chunk:
+                f.write(chunk)
+    return fp
+
+async def _tg_file_url(bot: Bot, file_id: str) -> str:
+    f = await bot.get_file(file_id)
+    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+
+# ---------- режиссёрский промпт ----------
+def _local_director_prompt(user_text: str) -> str:
+    return (
+        "Cinematic, natural lighting, realistic textures, 35mm look. "
+        "Scene: " + user_text.strip() + ". "
+        "Camera: slow push-in, slight handheld micro-movements. "
+        "Color: neutral, filmic contrast, gentle highlights. "
+        "Sound: (optional) subtle room ambience."
+    )
+
+def _openai_director_prompt(user_text: str) -> str:
+    if not OPENAI_API_KEY:
+        return _local_director_prompt(user_text)
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Ты режиссёр. Составь короткий кинематографичный prompt для text-to-video без лишней болтовни: сцена, свет, камера, цвет."},
+                    {"role": "user", "content": user_text}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 180
+            },
+            timeout=60
+        )
+        j = r.json()
+        if r.status_code >= 400:
+            logging.error(f"openai error {r.status_code}: {j}")
+            return _local_director_prompt(user_text)
+        return j["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.error(f"openai exception: {e}")
+        return _local_director_prompt(user_text)
+
+# ---------- WAN ----------
+async def wan_t2v(prompt: str, out_dir: str) -> Optional[str]:
+    version = WAN_MODEL_VERSION or _replicate_latest(WAN_MODEL_NAME)
+    if not version:
+        return None
+    inputs = {"prompt": prompt, "fps": VIDEO_FPS, "duration": VIDEO_DURATION, "seed": 42}
+    pid, _ = await asyncio.to_thread(_replicate_predict, version, inputs)
+    if not pid:
+        return None
+    final = await asyncio.to_thread(_replicate_wait, pid)
+    if final.get("status") != "succeeded":
+        logging.error(f"WAN t2v final: {final}")
+        return None
+    out = final.get("output")
+    url = out if isinstance(out, str) else (out[0] if isinstance(out, list) and out else None)
+    if not url:
+        return None
+    return await asyncio.to_thread(_download, url, out_dir, "wan_t2v_")
+
+async def wan_i2v(image_url: str, prompt: str, out_dir: str) -> Optional[str]:
+    version = WAN_I2V_MODEL_VERSION or _replicate_latest(WAN_I2V_MODEL_NAME)
+    if not version:
+        return None
+    inputs = {"image": image_url, "prompt": prompt or "gentle camera motion",
+              "fps": VIDEO_FPS, "duration": VIDEO_DURATION, "motion": 5, "seed": 42}
+    pid, _ = await asyncio.to_thread(_replicate_predict, version, inputs)
+    if not pid:
+        return None
+    final = await asyncio.to_thread(_replicate_wait, pid)
+    if final.get("status") != "succeeded":
+        logging.error(f"WAN i2v final: {final}")
+        return None
+    out = final.get("output")
+    url = out if isinstance(out, str) else (out[0] if isinstance(out, list) and out else None)
+    if not url:
+        return None
+    return await asyncio.to_thread(_download, url, out_dir, "wan_i2v_")
+
+# ---------- TELEGRAM ----------
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    await m.answer(
+        "Напиши идею (текст) или пришли фото.\n"
+        "• Текст → WAN t2v (черновик)\n"
+        "• Фото  → WAN i2v (черновик)\n"
+        "Под черновиком будет кнопка: «🔁 Сделать 4K в Luma (платно)»"
+    )
+
+@dp.message(F.photo)
+async def on_photo(m: Message):
+    chat_id = m.chat.id
+    user_text = (last_prompt.get(chat_id) or "gentle camera motion")
+    director = await asyncio.to_thread(_openai_director_prompt, user_text)
+
+    # отправим промпт отдельным сообщением
+    await m.answer(f"🎬 Режиссёрский промпт:\n```\n{director}\n```", parse_mode="Markdown")
+
+    file_id = m.photo[-1].file_id
+    img_url = await _tg_file_url(bot, file_id)
+
+    await m.answer("Делаю видео (WAN i2v)…")
+    fp = await wan_i2v(img_url, director, OUT_DIR)
+    if not fp:
+        await m.answer("Не удалось сгенерировать видео в WAN i2v. Попробуй другое фото/текст.")
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Сделать 4K в Luma (платно)", callback_data="upscale_luma")]
+        ]
+    )
+    await m.answer_video(video=FSInputFile(fp), caption="Черновик (WAN i2v)", reply_markup=kb)
+
+@dp.message(F.text.len() > 0)
+async def on_text(m: Message):
+    chat_id = m.chat.id
+    user_text = m.text.strip()
+    last_prompt[chat_id] = user_text
+
+    director = await asyncio.to_thread(_openai_director_prompt, user_text)
+    await m.answer(f"🎬 Режиссёрский промпт:\n```\n{director}\n```", parse_mode="Markdown")
+
+    await m.answer("Делаю видео (WAN t2v)…")
+    fp = await wan_t2v(director, OUT_DIR)
+    if not fp:
+        await m.answer("Не удалось сделать черновик в WAN t2v. Попробуй упростить идею или пришли фото.")
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Сделать 4K в Luma (платно)", callback_data="upscale_luma")]
+        ]
+    )
+    await m.answer_video(video=FSInputFile(fp), caption="Черновик (WAN t2v)", reply_markup=kb)
+
+@dp.callback_query(F.data == "upscale_luma")
+async def on_upscale(cb: CallbackQuery):
+    chat_id = cb.message.chat.id if cb.message else cb.from_user.id
+    prompt = last_prompt.get(chat_id) or "high quality 4K cinematic scene"
+    # Повторно строим режиссёрский (те же правила, чтобы совпадало с черновиком)
+    director = await asyncio.to_thread(_openai_director_prompt, prompt)
+
+    if not LUMA_ENABLED:
+        await cb.answer("Luma 4K: настраиваю endpoint…", show_alert=True)
+        await cb.message.answer("Пробую подключить рабочий эндпойнт Luma. Если 404 — адаптер сам выберет другой маршрут.")
+        try:
+            files = await asyncio.to_thread(luma_generate_4k, director, 1, OUT_DIR)
+        except Exception as e:
+            await cb.message.answer(f"Luma 4K не стартовала: {e}")
+            return
+    else:
+        await cb.answer("Запускаю Luma 4K…")
+        try:
+            files = await asyncio.to_thread(luma_generate_4k, director, 1, OUT_DIR)
+        except Exception as e:
+            await cb.message.answer(f"Luma 4K не стартовала: {e}")
+            return
+
+    if not files:
+        await cb.message.answer("Luma 4K не вернула файл. Проверю логи.")
+        return
+
+    fp = files[0]
+    await cb.message.answer_video(video=FSInputFile(fp), caption="Премиум (Luma 4K)")
+
+async def main():
+    log.info(f"ENV: BOT_TOKEN={'set' if BOT_TOKEN else 'EMPTY'}, REPLICATE={'set' if REPLICATE_API_TOKEN else 'EMPTY'}")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot stopped")

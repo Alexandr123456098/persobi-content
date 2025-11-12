@@ -1,0 +1,234 @@
+import os
+import time
+import json
+import ssl
+import http.client
+import requests
+from pathlib import Path
+
+
+class ReplicateClient:
+    """
+    Клиент для Replicate (T2V/I2V).
+    - upload: пытаемся через поле `content`, затем `file`, затем сырой multipart (Content-Length без chunked).
+    - если API вернул только id (без url) — возвращаем replicate://files/<id>, а потом резолвим в URL.
+    """
+
+    def __init__(self, out_dir: str):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.api_token = (os.getenv("REPLICATE_API_TOKEN") or "").strip()
+        if not self.api_token:
+            raise RuntimeError("REPLICATE_API_TOKEN не задан")
+
+        self.model = (os.getenv("REPLICATE_MODEL") or "wan-video/wan-2.2-t2v-fast").strip()
+        self.version = (os.getenv("REPLICATE_MODEL_VERSION") or "").strip()
+
+        self.base = "https://api.replicate.com/v1"
+        self.timeout = float(os.getenv("REPLICATE_TIMEOUT", "180"))
+        self.poll_every = float(os.getenv("REPLICATE_POLL_EVERY", "2.0"))
+
+    # --- HTTP helpers ---
+
+    def _headers(self):
+        return {
+            "Authorization": f"Token {self.api_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _post(self, url: str, payload: dict) -> dict:
+        r = requests.post(url, headers=self._headers(), data=json.dumps(payload), timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Replicate POST {url} failed: {r.status_code} {r.text}")
+        return r.json()
+
+    def _get(self, url: str) -> dict:
+        r = requests.get(url, headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Replicate GET {url} failed: {r.status_code} {r.text}")
+        return r.json()
+
+    def _download(self, url: str) -> str:
+        r = requests.get(url, stream=True, timeout=120)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Replicate media GET failed: {r.status_code}")
+        out_path = self.out_dir / f"replicate_{int(time.time())}.mp4"
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        return str(out_path)
+
+    # --- upload ---
+
+    def _upload_file(self, path: str) -> str:
+        """
+        Порядок:
+          1) requests multipart с полем `content`
+          2) если снова "Missing content" — пробуем `file`
+          3) крайний случай — сырой multipart (поле `content`) с явным Content-Length
+          4) если вернули id без url — возвращаем replicate://files/<id>
+        """
+        ip = Path(path)
+        if (not ip.exists()) or ip.stat().st_size == 0:
+            raise RuntimeError(f"Replicate file upload: local file empty or missing: {path}")
+
+        files_url = f"{self.base}/files"
+        data = ip.read_bytes()
+
+        # 1) Поле content
+        r = requests.post(
+            files_url,
+            headers={"Authorization": f"Token {self.api_token}"},
+            files={"content": (ip.name, data, "image/jpeg")},
+            timeout=90,
+        )
+        txt = r.text
+
+        # 2) Fallback: поле file
+        if r.status_code == 400 and "Missing content" in txt:
+            r = requests.post(
+                files_url,
+                headers={"Authorization": f"Token {self.api_token}"},
+                files={"file": (ip.name, data, "image/jpeg")},
+                timeout=90,
+            )
+            txt = r.text
+
+        # 3) Сырой multipart без chunked (поле content)
+        if r.status_code == 400 and "Missing content" in txt:
+            boundary = f"----cf{int(time.time())}"
+            pre = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="content"; filename="{ip.name}"\r\n'
+                f"Content-Type: image/jpeg\r\n\r\n"
+            ).encode("utf-8")
+            post = f"\r\n--{boundary}--\r\n".encode("utf-8")
+            body = pre + data + post
+
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection("api.replicate.com", 443, context=ctx, timeout=90)
+            conn.putrequest("POST", "/v1/files")
+            conn.putheader("Authorization", f"Token {self.api_token}")
+            conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+            conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders()
+            conn.send(body)
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            if resp.status >= 400:
+                raise RuntimeError(f"Replicate file upload failed: {resp.status} {raw.decode('utf-8','ignore')}")
+            try:
+                j = json.loads(raw.decode("utf-8"))
+            except Exception:
+                raise RuntimeError(f"Replicate file upload: non-JSON response: {raw[:200]!r}")
+        else:
+            if r.status_code >= 400:
+                raise RuntimeError(f"Replicate file upload failed: {r.status_code} {txt}")
+            try:
+                j = r.json()
+            except Exception:
+                raise RuntimeError(f"Replicate file upload: non-JSON response: {txt[:200]!r}")
+
+        url = j.get("url")
+        fid = j.get("id")
+        if url:
+            return url
+        if fid:
+            return f"replicate://files/{fid}"
+        raise RuntimeError(f"Replicate file upload: neither url nor id in response: {j}")
+def _resolve_file_ref(self, ref: str) -> str:
+    """
+    Превращает replicate://files/<id> в обычный https-URL через GET /v1/files/<id>.
+    Если уже https — возвращает как есть.
+    """
+    if not isinstance(ref, str):
+        return ref
+    pref = "replicate://files/"
+    if not ref.startswith(pref):
+        return ref
+    fid = ref[len(pref):]
+    import requests
+    r = requests.get(
+        f"{self.base}/files/{fid}",
+        headers={"Authorization": f"Token {self.api_token}"},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Replicate files GET failed: {r.status_code} {r.text}")
+    j = r.json()
+    # Попробуем несколько возможных полей
+    for k in ("url", "download_url", "https_url"):
+        v = j.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    if isinstance(j.get("urls"), dict):
+        for k in ("download", "self", "get"):
+            v = j["urls"].get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+    raise RuntimeError(f"Replicate files/{fid}: no usable URL in response: {j}")
+
+    
+
+    def _poll_until_done(self, get_url: str) -> str:
+        t0 = time.time()
+        while True:
+            p = self._get(get_url)
+            status = p.get("status")
+            if status in ("succeeded", "failed", "canceled"):
+                if status != "succeeded":
+                    raise RuntimeError(f"Replicate generation status={status}: {p}")
+                output = p.get("output")
+                if isinstance(output, list) and output:
+                    return self._download(output[-1])
+                if isinstance(output, str) and output:
+                    return self._download(output)
+                raise RuntimeError(f"Replicate: empty output: {p}")
+            if time.time() - t0 > self.timeout:
+                raise TimeoutError("Replicate generation timeout")
+            time.sleep(self.poll_every)
+
+    # --- T2V ---
+
+    def generate(self, prompt: str, duration: int = 5) -> str:
+        input_payload = {"prompt": prompt, "duration": duration}
+        if self.version:
+            body = {"version": self.version, "input": input_payload}
+            pred = self._post(f"{self.base}/predictions", body)
+        else:
+            owner, name = self.model.split("/", 1)
+            pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": input_payload})
+        get_url = pred.get("urls", {}).get("get")
+        if not get_url:
+            raise RuntimeError(f"Replicate: нет urls.get в ответе: {pred}")
+        return self._poll_until_done(get_url)
+
+    # --- I2V ---
+
+    def generate_from_image(self, image_path: str, prompt: str, duration: int = 5) -> str:
+        model_i2v = (os.getenv("REPLICATE_MODEL_I2V") or "wan-video/wan-2.2-i2v-fast").strip()
+        owner, name = model_i2v.split("/", 1)
+
+        img_ref = self._upload_file(image_path)
+        img_url = self._resolve_file_ref(img_ref)
+
+        input_payload = {
+            "image": img_url,
+            "prompt": (prompt or "").strip(),
+            "duration": duration,
+        }
+
+        neg_base = (os.getenv("I2V_NEGATIVE_BASE") or "").strip()
+        if neg_base:
+            input_payload["negative_prompt"] = neg_base
+        if (os.getenv("I2V_STRICT_REFERENCE", "1").strip() not in ("0", "false", "False")):
+            input_payload["strict_reference"] = True
+
+        pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": input_payload})
+        get_url = pred.get("urls", {}).get("get")
+        if not get_url:
+            raise RuntimeError(f"Replicate I2V: нет urls.get в ответе: {pred}")
+        return self._poll_until_done(get_url)

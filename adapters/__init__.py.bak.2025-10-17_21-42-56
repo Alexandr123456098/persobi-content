@@ -1,0 +1,100 @@
+# /opt/content_factory/adapters/__init__.py
+
+import os
+import logging
+from typing import List
+
+logger = logging.getLogger(__name__)
+
+# === Провайдеры-адаптеры — импортируем тут, чтобы не падать без ключей ===
+# У тебя эти файлы уже есть:
+#   adapters/luma_adapter.py  → LumaClient
+#   adapters/runway_adapter.py → RunwayClient (если реализован)
+#   adapters/ffmpeg_stub.py   → generate_stub (или аналог)
+try:
+    from .luma_adapter import LumaClient
+except Exception:
+    LumaClient = None
+
+try:
+    from .runway_adapter import RunwayClient  # если у тебя пока шаблон — импорт пройдёт
+except Exception:
+    RunwayClient = None
+
+from .ffmpeg_stub import generate as ffmpeg_generate  # если у тебя другая функция — см. комментарий ниже
+
+
+# --- LUMA ---
+async def _try_luma(prompt: str, n: int, out_dir: str) -> List[str]:
+    if os.getenv("LUMA_API_KEY", "").strip() == "":
+        raise RuntimeError("LUMA_API_KEY is empty")
+    if LumaClient is None:
+        raise RuntimeError("LumaClient not available")
+
+    client = LumaClient.from_env()  # должен поднять исключение, если нет ключей/урлов
+    files = await client.generate(prompt, n, out_dir)  # ВАЖНО: await!
+    if not isinstance(files, list):
+        raise RuntimeError(f"Luma returned non-list: {type(files)}")
+    return files
+
+
+# --- RUNWAY (опционально) ---
+async def _try_runway(prompt: str, n: int, out_dir: str) -> List[str]:
+    if os.getenv("RUNWAY_API_KEY", "").strip() == "":
+        raise RuntimeError("RUNWAY_API_KEY is empty")
+    if RunwayClient is None:
+        raise RuntimeError("RunwayClient not available")
+
+    client = RunwayClient.from_env()
+    files = await client.generate(prompt, n, out_dir)  # ВАЖНО: await!
+    if not isinstance(files, list):
+        raise RuntimeError(f"Runway returned non-list: {type(files)}")
+    return files
+
+
+# --- FFMPEG (черновик, локально и офлайн) ---
+async def _try_ffmpeg(prompt: str, n: int, out_dir: str) -> List[str]:
+    # Если у тебя в ffmpeg_stub другая сигнатура, например generate_stub(prompt, n, out_dir),
+    # поменяй вызов ниже. Главное — вернуть список путей к готовым файлам.
+    files = ffmpeg_generate(prompt, n, out_dir)
+    if not isinstance(files, list):
+        files = [files]
+    return files
+
+
+# === Главный мультипровайдер ===
+async def render_videos(prompt: str, n: int, out_dir: str) -> List[str]:
+    """
+    Перебираем провайдеры в порядке из env PROVIDERS.
+    Разрешённые имена: luma, runway, ffmpeg.
+    Возвращаем список путей к файлам.
+    """
+    providers_order = os.getenv("PROVIDERS", "ffmpeg").split(",")
+    providers_order = [p.strip().lower() for p in providers_order if p.strip()]
+
+    name2fn = {
+        "luma": _try_luma,
+        "runway": _try_runway,
+        "ffmpeg": _try_ffmpeg,
+    }
+
+    last_error = None
+    for name in providers_order:
+        fn = name2fn.get(name)
+        if not fn:
+            logger.warning("Unknown provider in PROVIDERS: %s", name)
+            continue
+
+        os.environ["_LAST_PROVIDER"] = name.upper()
+        try:
+            logger.info("PROVIDER=%s start", name.upper())
+            files = await fn(prompt, n, out_dir)  # ВАЖНО: await провайдера
+            if files:
+                logger.info("PROVIDER=%s ok: %s", name.upper(), files)
+                return files
+        except Exception as e:
+            last_error = e
+            logger.exception("PROVIDER=%s failed: %s", name.upper(), e)
+
+    # Если ничего не вышло — кидаем последнюю ошибку (чтобы бот мог поймать и сообщить)
+    raise RuntimeError(f"All providers failed. Last error: {last_error}")

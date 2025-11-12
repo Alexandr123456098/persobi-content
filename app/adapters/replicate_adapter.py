@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+Replicate Adapter — SLA FINAL + Warmup-Drop + Жёсткая валидация токена
+- Валидируем REPLICATE_API_TOKEN (env → .env). Если токен пуст/путь/короткий — немедленный отказ (никаких оффлайнов).
+- 422-обход: каскад fps [start,24,20,16,12,8] × лестница num_frames (121..8), ретраи сетевые ×3 на вариант.
+- Warmup-drop: запрашиваем лишние кадры (~0.5 s), затем автотрим первых кадров, итоговая длительность ровно N.
+- I2V: локальные картинки — заливаем на catbox.moe (transfer.sh отключён).
+- JSON-отчёты: /opt/content_factory/out/predictions/<rand>.json (ok/err, модель, пейлоад, варианты, ошибка).
+"""
+
+import os, sys, json, shlex, time, subprocess, uuid
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+
+API_BASE = "https://api.replicate.com/v1"
+T2V_MODEL = os.environ.get("REPLICATE_MODEL_T2V", "wan-video/wan-2.2-t2v-fast")
+I2V_MODEL = os.environ.get("REPLICATE_MODEL_I2V", "wan-video/wan-2.2-i2v-fast")
+
+ROOT = Path("/opt/content_factory")
+OUT_DIR = Path(os.environ.get("OUT_DIR", str(ROOT / "out")))
+PRED_DIR = OUT_DIR / "predictions"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PRED_DIR.mkdir(parents=True, exist_ok=True)
+
+ENV_PATH = ROOT / ".env"
+DEFAULT_SECONDS = int(os.environ.get("DEFAULT_DURATION", "5"))
+DEFAULT_FPS = int(os.environ.get("REPLICATE_FPS", "16"))
+MAX_FRAMES_HARD = 121
+WARMUP_SEC = float(os.environ.get("REPLICATE_WARMUP_SEC", "0.5"))
+FIXED_SEED = int(os.environ.get("REPLICATE_FIXED_SEED", "123456789"))
+
+PROMPT_PRIMER = (
+    "Start immediately with a sharp, fully resolved photorealistic frame. "
+    "No painterly intro or plastic placeholder. Cinematic, stable exposure, no glitches. "
+)
+
+class ReplicateError(RuntimeError):
+    pass
+
+def _run(cmd: str, stdin: Optional[bytes]=None, check=True) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, input=stdin, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command failed [{p.returncode}]: {cmd}\nSTDERR:\n{p.stderr.decode(errors='ignore')}")
+    return p
+
+def _parse_dotenv_token(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        for line in path.read_text().splitlines():
+            if line.strip().startswith("REPLICATE_API_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        return ""
+    return ""
+
+def _looks_like_path(s: str) -> bool:
+    s = s.strip()
+    return s.startswith("/") or s.startswith("./") or s.startswith("../")
+
+def _ensure_token() -> str:
+    tok = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+    if not tok:
+        tok = _parse_dotenv_token(ENV_PATH).strip()
+    if (not tok) or _looks_like_path(tok) or len(tok) < 20:
+        raise ReplicateError("REPLICATE_API_TOKEN invalid or missing")
+    return tok
+
+def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    hdr = " ".join([f"-H {shlex.quote(f'{k}: {v}')}" for k,v in headers.items()])
+    data = f"-d {shlex.quote(json.dumps(body))}" if body else ""
+    cmd = f"curl -fsS -X {method} {hdr} {data} {shlex.quote(url)}"
+    p = _run(cmd, check=True)
+    try:
+        return json.loads(p.stdout.decode())
+    except Exception as e:
+        raise ReplicateError(f"Bad JSON from {url}: {e}\nRAW:\n{p.stdout.decode(errors='ignore')}")
+
+def _post_json(url: str, js: Dict[str,Any], tok: str) -> Dict[str,Any]:
+    return _curl_json("POST", url, {"Authorization": f"Token {tok}", "Content-Type":"application/json"}, js)
+
+def _get_json(url: str, tok: str) -> Dict[str,Any]:
+    return _curl_json("GET", url, {"Authorization": f"Token {tok}"})
+
+def _download(url: str, dst: Path):
+    _run(f"curl -fsSL --retry 3 -o {shlex.quote(str(dst))} {shlex.quote(url)}", check=True)
+
+def _upload_catbox(local_path: Path) -> str:
+    out = _run(f"curl -fsS -F 'reqtype=fileupload' -F 'fileToUpload=@{shlex.quote(str(local_path))}' https://catbox.moe/user/api.php", check=True).stdout.decode().strip()
+    if not out.startswith("http"):
+        raise ReplicateError(f"catbox upload failed: {out}")
+    return out
+
+def _image_url(img: str) -> str:
+    low = img.lower().strip()
+    if low.startswith("http://") or low.startswith("https://"):
+        return img
+    p = Path(img)
+    if not p.exists():
+        raise ReplicateError(f"Image not found: {img}")
+    return _upload_catbox(p)
+
+def _quantize_frames(n: int) -> int:
+    safe = [121,112,104,96,88,81,72,64,60,56,48,40,36,32,28,24,20,16,12,8]
+    n = max(1, min(n, MAX_FRAMES_HARD))
+    # берём ближайшее допустимое значение вниз
+    for s in safe:
+        if s <= n:
+            return s
+    return 8
+
+def _calc_frames(sec: int, fps: int) -> int:
+    return _quantize_frames(int(round(sec * fps)))
+
+def _log_json(js: Dict[str,Any]):
+    try:
+        fname = PRED_DIR / f"{uuid.uuid4().hex[:10]}.json"
+        fname.write_text(json.dumps(js, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+def _is_422(err: Exception) -> bool:
+    s = str(err)
+    return " 422" in s or "HTTP 422" in s or "error: 422" in s or "422\n" in s
+
+def _predict_with_sla(model: str, base_payload: Dict[str,Any], tok: str) -> str:
+    attempts: List[Dict[str,Any]] = []
+
+    start_fps = int(base_payload.get("frames_per_second", DEFAULT_FPS))
+    start_nf  = int(base_payload.get("num_frames", _calc_frames(DEFAULT_SECONDS, start_fps)))
+
+    # порядок fps
+    fps_order: List[int] = []
+    for f in [start_fps, 24, 20, 16, 12, 8]:
+        if f not in fps_order:
+            fps_order.append(f)
+
+    frame_master = [121,112,104,96,88,81,72,64,60,56,48,40,36,32,28,24,20,16,12,8]
+    variants: List[Dict[str,int]] = []
+    for i, fps in enumerate(fps_order):
+        if i == 0:
+            start_q = _quantize_frames(start_nf)
+            ladder = [x for x in frame_master if x <= start_q]
+            if start_q not in ladder:
+                ladder = [start_q] + ladder
+        else:
+            ladder = [x for x in frame_master if x <= _calc_frames(DEFAULT_SECONDS, fps)]
+        for nf in ladder:
+            variants.append({"fps": int(fps), "nf": int(min(nf, MAX_FRAMES_HARD))})
+
+    for var in variants:
+        payload = dict(base_payload)
+        payload["frames_per_second"] = int(var["fps"])
+        payload["num_frames"] = int(var["nf"])
+
+        for net_try in range(1, 4):
+            try:
+                r = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": payload}, tok)
+                get_url = (r.get("urls") or {}).get("get", "")
+                if not get_url:
+                    raise ReplicateError(f"No urls.get in create response: {r}")
+
+                # опрос статуса
+                while True:
+                    s = _get_json(get_url, tok)
+                    st = s.get("status")
+                    if st == "succeeded":
+                        out = s.get("output")
+                        url = out[-1] if isinstance(out, list) and out else (out if isinstance(out, str) else "")
+                        if not url:
+                            raise ReplicateError(f"No output url in {s}")
+                        _log_json({"ok": True, "model": model, "payload": payload, "variant": var,
+                                   "attempts": attempts + [{"variant": var, "net_try": net_try, "status": "succeeded"}],
+                                   "url": url, "ts": time.time()})
+                        return url
+                    if st == "failed":
+                        attempts.append({"variant": var, "net_try": net_try, "status": "failed", "resp": s})
+                        break
+                    time.sleep(2.0)
+
+            except Exception as e:
+                msg = str(e)
+                if net_try < 3:
+                    _log_json({"retry": "[CF RETRY]", "variant": var, "net_try": net_try, "error": msg, "ts": time.time()})
+                    time.sleep(1.0)
+                    continue
+                if _is_422(e) or "validation" in msg.lower():
+                    attempts.append({"variant": var, "net_try": net_try, "status": "422/validation", "error": msg})
+                    break
+                attempts.append({"variant": var, "net_try": net_try, "status": "error", "error": msg})
+                break
+
+    _log_json({"ok": False, "model": model, "base_payload": base_payload, "attempts": attempts, "ts": time.time()})
+    raise ReplicateError("SLA: exhausted variants")
+
+def _ffmpeg_trim(src: Path, fps: int, seconds: int, warm_frames: int) -> Path:
+    # сдвиг по времени на первые warm_frames
+    ss = warm_frames / max(1, fps)
+    out = src.with_suffix(".trim.mp4")
+    cmd = (
+        f"ffmpeg -y -ss {ss:.2f} -i {shlex.quote(str(src))} "
+        f"-t {seconds:.2f} -an -c:v libx264 -preset veryfast -crf 18 "
+        f"-pix_fmt yuv420p -movflags +faststart {shlex.quote(str(out))}"
+    )
+    _run(cmd, check=True)
+    return out
+
+def _ffmpeg_norm(src: Path, fps: int) -> Path:
+    out = src.with_suffix(".final.mp4")
+    vf = "scale=-2:720:flags=lanczos"
+    cmd = f"ffmpeg -y -i {shlex.quote(str(src))} -vf {shlex.quote(vf)} -r {int(fps)} -c:v libx264 -preset veryfast -movflags +faststart {shlex.quote(str(out))}"
+    _run(cmd, check=True)
+    return out
+
+class ReplicateClient:
+    def __init__(self, token: Optional[str]=None):
+        self.token = token or _ensure_token()
+
+    def _finalize(self, downloaded_path: Path, prefix: str, fps: int, seconds: int, warm_frames: int) -> Path:
+        trimmed = _ffmpeg_trim(downloaded_path, fps=fps, seconds=seconds, warm_frames=warm_frames)
+        normalized = _ffmpeg_norm(trimmed, fps=fps)
+        final = OUT_DIR / f"{prefix}_{int(time.time())}.mp4"
+        normalized.rename(final)
+        return final
+
+    def generate_from_text(self, prompt: str, seconds: int=DEFAULT_SECONDS, fps: Optional[int]=None) -> str:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ReplicateError("prompt is required")
+        fps = int(fps or DEFAULT_FPS)
+        warm_frames = max(1, round(WARMUP_SEC * fps))
+        total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
+
+        base = {
+            "prompt": f"{PROMPT_PRIMER}{prompt}",
+            "num_frames": total_frames,
+            "frames_per_second": fps,
+            "seed": FIXED_SEED
+        }
+        media_url = _predict_with_sla(T2V_MODEL, base, self.token)
+        tmp = OUT_DIR / f"replicate_t2v_{int(time.time())}.dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps, seconds=seconds, warm_frames=warm_frames)
+        return str(final_path)
+
+    def generate_from_image(self, image: str, prompt: str="", seconds: int=DEFAULT_SECONDS, fps: Optional[int]=None) -> str:
+        fps = int(fps or DEFAULT_FPS)
+        warm_frames = max(1, round(WARMUP_SEC * fps))
+        total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
+
+        # локальный путь → catbox; http/https пропускаем как есть
+        if image.lower().startswith("http://") or image.lower().startswith("https://"):
+            img_url = image
+        else:
+            p = Path(image)
+            if not p.exists():
+                raise ReplicateError(f"Image not found: {image}")
+            img_url = _upload_catbox(p)
+
+        base = {
+            "image": img_url,
+            "prompt": f"{PROMPT_PRIMER}{prompt}",
+            "num_frames": total_frames,
+            "frames_per_second": fps,
+            "seed": FIXED_SEED,
+            "strength": float(os.getenv("REPLICATE_I2V_STRENGTH", "0.55")),
+            "denoise": float(os.getenv("REPLICATE_I2V_DENOISE", "0.35")),
+        }
+        media_url = _predict_with_sla(I2V_MODEL, base, self.token)
+        tmp = OUT_DIR / f"replicate_i2v_{int(time.time())}.dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = self._finalize(tmp, "replicate_wanA_i2v", fps=fps, seconds=seconds, warm_frames=warm_frames)
+        return str(final_path)
+
+    # Back-compat
+    def text(self, prompt: str) -> str:
+        return self.generate_from_text(prompt)
+
+    def image(self, image: str, prompt: str="") -> str:
+        return self.generate_from_image(image, prompt)
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", required=True, choices=["text", "image"])
+    p.add_argument("--prompt", default="A cinematic shot, soft light")
+    p.add_argument("--image", default="")
+    p.add_argument("--seconds", type=int, default=DEFAULT_SECONDS)
+    p.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    a = p.parse_args()
+
+    rc = ReplicateClient()
+    try:
+        if a.mode == "text":
+            out_path = rc.generate_from_text(a.prompt, seconds=a.seconds, fps=a.fps)
+        else:
+            if not a.image:
+                raise ReplicateError("--image required for mode=image")
+            out_path = rc.generate_from_image(a.image, a.prompt or "", seconds=a.seconds, fps=a.fps)
+        print(json.dumps({"path": out_path}, ensure_ascii=False))
+    except Exception as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(1)

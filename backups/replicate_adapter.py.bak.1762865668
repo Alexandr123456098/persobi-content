@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+import os, time, json, ssl, http.client, requests
+from pathlib import Path
+
+class ReplicateClient:
+    """
+    Клиент для Replicate (T2V/I2V) — поддержка num_frames/frames_per_second.
+    """
+    def __init__(self, out_dir: str):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.api_token = (os.getenv("REPLICATE_API_TOKEN") or "").strip()
+        if not self.api_token:
+            raise RuntimeError("REPLICATE_API_TOKEN не задан")
+        self.base = "https://api.replicate.com/v1"
+        self.timeout = float(os.getenv("REPLICATE_TIMEOUT", "180"))
+        self.poll_every = float(os.getenv("REPLICATE_POLL_EVERY", "2.0"))
+        self.fps = int(os.getenv("REPLICATE_FPS", "16"))
+
+    def _headers(self):
+        return {"Authorization": f"Token {self.api_token}", "Content-Type": "application/json"}
+
+    def _post(self, url, payload):
+        r = requests.post(url, headers=self._headers(), data=json.dumps(payload), timeout=60)
+        if r.status_code >= 400:
+            raise RuntimeError(f"POST {url} {r.status_code}: {r.text}")
+        return r.json()
+
+    def _get(self, url):
+        r = requests.get(url, headers=self._headers(), timeout=60)
+        if r.status_code >= 400:
+            raise RuntimeError(f"GET {url} {r.status_code}: {r.text}")
+        return r.json()
+
+    def _download(self, url):
+        r = requests.get(url, stream=True, timeout=180)
+        if r.status_code >= 400:
+            raise RuntimeError(f"media GET {r.status_code}")
+        p = self.out_dir / f"replicate_{int(time.time())}.mp4"
+        with open(p, "wb") as f:
+            for ch in r.iter_content(1048576):
+                f.write(ch)
+        return str(p)
+
+    def _resolve_file_ref(self, ref: str) -> str:
+        if not isinstance(ref, str):
+            return ref
+        pref = "replicate://files/"
+        if not ref.startswith(pref):
+            return ref
+        fid = ref[len(pref):]
+        r = requests.get(f"{self.base}/files/{fid}",
+                         headers={"Authorization": f"Token {self.api_token}"},
+                         timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"files GET {r.status_code}: {r.text}")
+        j = r.json()
+        for k in ("url", "download_url", "https_url"):
+            v = j.get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        if isinstance(j.get("urls"), dict):
+            for k in ("download", "self", "get"):
+                v = j["urls"].get(k)
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+        raise RuntimeError(f"no usable url: {j}")
+
+    def _upload_file(self, path: str) -> str:
+        ip = Path(path)
+        if not ip.exists() or ip.stat().st_size == 0:
+            raise RuntimeError(f"local file missing: {path}")
+        data = ip.read_bytes()
+        fname = ip.name
+        files_url = f"{self.base}/files"
+        for field in ("content", "file"):
+            r = requests.post(files_url,
+                              headers={"Authorization": f"Token {self.api_token}"},
+                              files={field: (fname, data, "image/jpeg")},
+                              timeout=90)
+            if r.status_code == 201:
+                j = r.json()
+                url = j.get("url") or (f"replicate://files/{j.get('id')}" if j.get("id") else None)
+                if url:
+                    return url
+        # fallback
+        boundary = f"----cf{int(time.time())}"
+        pre = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="content"; filename="{fname}"\r\n'
+            f"Content-Type: image/jpeg\r\n\r\n"
+        ).encode()
+        post = f"\r\n--{boundary}--\r\n".encode()
+        body = pre + data + post
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection("api.replicate.com", 443, context=ctx, timeout=90)
+        conn.putrequest("POST", "/v1/files")
+        conn.putheader("Authorization", f"Token {self.api_token}")
+        conn.putheader("Content-Type", f"multipart/form-data; boundary=%s" % boundary)
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        conn.send(body)
+        raw = conn.getresponse().read()
+        conn.close()
+        j = json.loads(raw.decode(errors="ignore"))
+        return j.get("url") or (f"replicate://files/{j.get('id')}" if j.get("id") else None) or "?"
+
+    def _poll_until_done(self, get_url: str) -> str:
+        t0 = time.time()
+        while True:
+            p = self._get(get_url)
+            s = p.get("status")
+            if s in ("succeeded", "failed", "canceled"):
+                if s != "succeeded":
+                    raise RuntimeError(f"status={s}: {p}")
+                o = p.get("output")
+                if isinstance(o, list) and o:
+                    return self._download(o[-1])
+                if isinstance(o, str) and o:
+                    return self._download(o)
+                raise RuntimeError(f"empty output: {p}")
+            if time.time() - t0 > self.timeout:
+                raise TimeoutError("timeout")
+            time.sleep(self.poll_every)
+
+    def generate_from_image(self, img: str, prompt: str, seconds: int = 5) -> str:
+        model = os.getenv("REPLICATE_MODEL_I2V", "wan-video/wan-2.2-i2v-fast")
+        owner, name = model.split("/", 1)
+        url = self._resolve_file_ref(self._upload_file(img))
+        frames = seconds * self.fps
+        inp = {"image": url, "prompt": prompt,
+               "num_frames": frames, "frames_per_second": self.fps,
+               "strict_reference": True}
+        try:
+            pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": inp})
+        except Exception as e:
+            # fallback, если модель не принимает num_frames
+            inp = {"image": url, "prompt": prompt, "duration": seconds, "strict_reference": True}
+            pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": inp})
+        g = pred.get("urls", {}).get("get")
+        if not g:
+            raise RuntimeError(f"нет urls.get: {pred}")
+        return self._poll_until_done(g)
+
+    def generate_from_text(self, prompt: str, seconds: int = 5) -> str:
+        model = os.getenv("REPLICATE_MODEL_T2V", "wan-video/wan-2.2-t2v-fast")
+        owner, name = model.split("/", 1)
+        frames = seconds * self.fps
+        inp = {"prompt": prompt, "num_frames": frames, "frames_per_second": self.fps}
+        try:
+            pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": inp})
+        except Exception:
+            inp = {"prompt": prompt, "duration": seconds}
+            pred = self._post(f"{self.base}/models/{owner}/{name}/predictions", {"input": inp})
+        g = pred.get("urls", {}).get("get")
+        if not g:
+            raise RuntimeError(f"нет urls.get: {pred}")
+        return self._poll_until_done(g)

@@ -1,0 +1,77 @@
+import os, logging
+from typing import List
+
+logger = logging.getLogger(__name__)
+
+# Optional providers
+try:
+    from .luma_adapter import LumaClient
+except Exception:
+    LumaClient = None
+
+try:
+    from .replicate_adapter import ReplicateClient  # Sora via Replicate
+except Exception:
+    ReplicateClient = None
+
+from .ffmpeg_stub import render_many as ffmpeg_render_many
+
+def _providers_from_env() -> list:
+    order = os.getenv('_PROVIDERS_ONCE') or os.getenv('PROVIDERS','ffmpeg')
+    if os.getenv('_PROVIDERS_ONCE'):
+        os.environ.pop('_PROVIDERS_ONCE', None)
+    return [x.strip().lower() for x in order.split(',') if x.strip()]
+
+async def _try_ffmpeg(prompt: str, n: int, out_dir: str):
+    logger.info("PROVIDER=FFMPEG start")
+    import asyncio, inspect
+    if inspect.iscoroutinefunction(ffmpeg_render_many):
+        files = await ffmpeg_render_many(prompt, n, out_dir)
+    else:
+        loop = asyncio.get_event_loop()
+        files = await loop.run_in_executor(None, lambda: ffmpeg_render_many(prompt, n, out_dir))
+    os.environ['_LAST_PROVIDER'] = 'FFMPEG'
+    logger.info("PROVIDER=FFMPEG ok: %r", files)
+    return files
+
+async def _try_luma(prompt: str, n: int, out_dir: str):
+    if LumaClient is None:
+        raise RuntimeError("LumaClient not available")
+    logger.info("PROVIDER=LUMA start")
+    client = LumaClient.from_env()
+    files = await client.generate(prompt, n, out_dir)
+    os.environ['_LAST_PROVIDER'] = 'LUMA'
+    logger.info("PROVIDER=LUMA ok: %r", files)
+    return files
+
+async def _try_sora(prompt: str, n: int, out_dir: str):
+    if ReplicateClient is None:
+        raise RuntimeError("ReplicateClient not available")
+    logger.info("PROVIDER=SORA start")
+    client = ReplicateClient.from_env()
+    files = await client.generate(prompt, n, out_dir)
+    os.environ['_LAST_PROVIDER'] = 'SORA'
+    logger.info("PROVIDER=SORA ok: %r", files)
+    return files
+
+async def render_videos(prompt: str, n: int, out_dir: str) -> List[str]:
+    name2fn = {
+        "sora": _try_sora,
+        "luma": _try_luma,
+        "ffmpeg": _try_ffmpeg,
+    }
+    providers = _providers_from_env()
+    last_error = None
+    for name in providers:
+        fn = name2fn.get(name)
+        if not fn:
+            logger.error("Unknown provider in PROVIDERS: %s", name)
+            continue
+        try:
+            return await fn(prompt, n, out_dir)
+        except Exception as e:
+            last_error = e
+            logger.error("PROVIDER=%s failed: %s", name.upper(), e)
+    if last_error:
+        raise last_error
+    return []

@@ -1,0 +1,441 @@
+# -*- coding: utf-8 -*-
+import os
+import asyncio
+import logging
+import tempfile
+import subprocess
+import shutil
+from pathlib import Path
+
+from aiogram import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import InvalidQueryID
+
+from app.adapters.replicate_adapter import ReplicateClient
+from app.adapters.offline_adapter import OfflineClient
+
+log = logging.getLogger("ui")
+
+OUT_DIR = os.environ.get("OUT_DIR", "/opt/content_factory/out")
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+_replicate = None
+_offline = None
+
+
+def _ensure_clients():
+    global _replicate, _offline
+    if _replicate is None:
+        _replicate = ReplicateClient(OUT_DIR)
+    if _offline is None:
+        _offline = OfflineClient(OUT_DIR)
+
+
+# ---------- state helpers ----------
+
+def _is_mapping(obj):
+    try:
+        return hasattr(obj, "items") and callable(getattr(obj, "items"))
+    except Exception:
+        return False
+
+
+def _get_box(state, name: str) -> dict:
+    if _is_mapping(state):
+        if name not in state or not isinstance(state[name], dict):
+            state[name] = {}
+        return state[name]
+    if not hasattr(state, name) or not isinstance(getattr(state, name), dict):
+        try:
+            setattr(state, name, {})
+        except Exception:
+            return {}
+    return getattr(state, name)
+
+
+def _ensure_state(bot_state):
+    _get_box(bot_state, "last_prompt")
+    _get_box(bot_state, "last_image")
+    _get_box(bot_state, "last_video")
+    _get_box(bot_state, "last_preview")   # путь к последнему сгенерённому mp4
+    _get_box(bot_state, "prefs")           # пользовательские настройки (по чату)
+    _get_box(bot_state, "prefs_duration")  # явные длительности по чатам
+
+
+def _get_last_prompt(state, chat_id: int, default: str = "") -> str:
+    return _get_box(state, "last_prompt").get(chat_id, default)
+
+
+def _set_last_prompt(state, chat_id: int, prompt: str):
+    if prompt:
+        _get_box(state, "last_prompt")[chat_id] = prompt.strip()
+
+
+def _get_last_image(state, chat_id: int) -> str | None:
+    return _get_box(state, "last_image").get(chat_id)
+
+
+def _set_last_image(state, chat_id: int, path: str):
+    if path and os.path.exists(path):
+        _get_box(state, "last_image")[chat_id] = path
+
+
+def _get_last_video(state, chat_id: int) -> str | None:
+    return _get_box(state, "last_video").get(chat_id)
+
+
+def _set_last_video(state, chat_id: int, path: str):
+    if path and os.path.exists(path):
+        _get_box(state, "last_video")[chat_id] = path
+
+
+def _get_last_preview(state, chat_id: int) -> str | None:
+    return _get_box(state, "last_preview").get(chat_id)
+
+
+def _set_last_preview(state, chat_id: int, path: str):
+    if path and os.path.exists(path):
+        _get_box(state, "last_preview")[chat_id] = path
+
+
+# ---------- duration prefs ----------
+
+def _get_env_default_duration() -> int:
+    try:
+        return int(os.environ.get("DEFAULT_DURATION", "5"))
+    except Exception:
+        return 5
+
+
+def _get_current_duration(state, chat_id: int) -> int:
+    """Берём выбранную пользователем длительность, если есть, иначе DEFAULT_DURATION из .env"""
+    box = _get_box(state, "prefs_duration")
+    if chat_id in box:
+        return int(box[chat_id])
+    return _get_env_default_duration()
+
+
+def _set_current_duration(state, chat_id: int, seconds: int):
+    box = _get_box(state, "prefs_duration")
+    box[chat_id] = int(seconds)
+
+
+def kb_ready(current_dur: int | None = None):
+    """Главная клавиатура под превьюшкой."""
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.row(
+        InlineKeyboardButton("🔁 Ещё раз", callback_data="again"),
+        InlineKeyboardButton("🧩 SORA 2", callback_data="sora2_go"),
+        InlineKeyboardButton("📷 По фото", callback_data="photo_help"),
+    )
+    kb.row(
+        InlineKeyboardButton("🎬 По видео", callback_data="video_help"),
+        InlineKeyboardButton(f"⏱ Длительность ({current_dur or _get_env_default_duration()}с)", callback_data="choose_duration"),
+    )
+    return kb
+
+
+def kb_choose_duration(current: int):
+    """Мини-меню выбора длительности."""
+    mark = lambda v: f"⏱ {v} сек {'•' if v == current else ''}"
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton(mark(5), callback_data="dur_5"),
+        InlineKeyboardButton(mark(10), callback_data="dur_10"),
+    )
+    return kb
+
+
+def _cinema_prompt(user_text: str) -> str:
+    raw = (user_text or "").strip()
+    return raw if raw else "Short daylight scene."
+
+
+# ---------- helpers for media ----------
+
+def _run(cmd: list[str]) -> bool:
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _try_ffmpeg_frame(src_video: str, dst_jpg: str) -> bool:
+    # пробуем кадр на ~1с, если не выйдет — с начала
+    return (
+        _run(["ffmpeg", "-y", "-ss", "1", "-i", src_video, "-frames:v", "1", "-q:v", "3", dst_jpg])
+        or _run(["ffmpeg", "-y", "-i", src_video, "-frames:v", "1", "-q:v", "3", dst_jpg])
+    ) and os.path.exists(dst_jpg) and os.stat(dst_jpg).st_size > 0
+
+
+def _try_ffmpeg(src: str, dst: str) -> bool:
+    return (
+        _run(["ffmpeg", "-y", "-i", src, "-vf", "format=rgb24", "-q:v", "3", dst])
+        and os.path.exists(dst) and os.stat(dst).st_size > 0
+    )
+
+
+def _try_imagemagick(src: str, dst: str) -> bool:
+    for cmd in (["magick", src, "-auto-orient", "-quality", "92", dst],
+                ["convert", src, "-auto-orient", "-quality", "92", dst]):
+        if _run(cmd) and os.path.exists(dst) and os.stat(dst).st_size > 0:
+            return True
+    return False
+
+
+def _try_pillow(src: str, dst: str) -> bool:
+    try:
+        from PIL import Image
+        Image.open(src).convert("RGB").save(dst, "JPEG", quality=92, optimize=True)
+        return os.path.exists(dst) and os.stat(dst).st_size > 0
+    except Exception:
+        return False
+
+
+def _reencode_to_jpeg(src_path: str) -> str:
+    dst = str(Path(src_path).with_suffix(".jpg"))
+    ok = _try_ffmpeg(src_path, dst) or _try_imagemagick(src_path, dst) or _try_pillow(src_path, dst)
+    try:
+        shutil.copy2(dst if ok else src_path, Path(OUT_DIR) / "last_upload.jpg")
+    except Exception:
+        pass
+    return dst if ok else src_path
+
+
+async def _ack_cb(query: types.CallbackQuery):
+    try:
+        await query.answer(cache_time=0)
+    except InvalidQueryID:
+        pass
+
+
+def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
+    # сохраняем путь к свежей превьюшке для «из крайней превьюшечки»
+    _set_last_preview(bot_state, chat_id, path)
+
+
+# ---------- HANDLERS ----------
+
+async def handle_text(message: types.Message, bot_state):
+    _ensure_clients()
+    _ensure_state(bot_state)
+
+    prompt = (message.text or "").strip()
+    if not prompt:
+        return await message.answer("Напиши описание сцены.")
+
+    _set_last_prompt(bot_state, message.chat.id, prompt)
+    _get_box(bot_state, "last_image").pop(message.chat.id, None)
+
+    await message.answer("🛠 Генерирую превью…")
+    loop = asyncio.get_event_loop()
+    dur = _get_current_duration(bot_state, message.chat.id)
+    try:
+        path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, dur)
+        log.info("[ui] replicate(text) OK: %s", path)
+    except Exception as e:
+        log.warning("[ui] replicate(text) failed: %s; fallback offline", e)
+        path = await loop.run_in_executor(None, _offline.generate, prompt, dur)
+
+    _store_preview_and_reply_path(bot_state, message.chat.id, path)
+    with open(path, "rb") as f:
+        await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready(dur))
+
+
+async def handle_photo(message: types.Message, bot_state):
+    _ensure_clients()
+    _ensure_state(bot_state)
+
+    caption = _cinema_prompt(message.caption or "")
+    _set_last_prompt(bot_state, message.chat.id, caption or "сделай видео по фото")
+
+    await message.answer("🛠 Генерирую превью по фото…")
+    loop = asyncio.get_event_loop()
+    tmp_path = None
+    dur = _get_current_duration(bot_state, message.chat.id)
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="cf_photo_", suffix=".img", dir=OUT_DIR)
+        os.close(fd)
+        if getattr(message, "photo", None):
+            await message.photo[-1].download(destination_file=tmp_path)
+        elif getattr(message, "document", None):
+            await message.document.download(destination_file=tmp_path)
+        else:
+            raise RuntimeError("no photo/document in message")
+
+        jpath = _reencode_to_jpeg(tmp_path)
+        path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, caption or "", dur)
+        _set_last_image(bot_state, message.chat.id, jpath)
+        log.info("[ui] replicate(photo) OK: %s", path)
+    except Exception as e:
+        log.warning("[ui] photo flow failed: %s — fallback offline", e)
+        path = await loop.run_in_executor(None, _offline.generate, caption, dur)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    _store_preview_and_reply_path(bot_state, message.chat.id, path)
+    with open(path, "rb") as f:
+        await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready(dur))
+
+
+async def handle_video(message: types.Message, bot_state):
+    """
+    Видео → берём кадр (ffmpeg), прогоняем как I2V.
+    Если ffmpeg недоступен — фолбэк в offline.generate.
+    """
+    _ensure_clients()
+    _ensure_state(bot_state)
+
+    caption = _cinema_prompt(message.caption or "")
+    _set_last_prompt(bot_state, message.chat.id, caption)
+    await message.answer("🛠 Обрабатываю видео…")
+
+    loop = asyncio.get_event_loop()
+    tmp_video = None
+    frame_jpg = None
+    dur = _get_current_duration(bot_state, message.chat.id)
+    try:
+        # 1) скачать видео
+        fdv, tmp_video = tempfile.mkstemp(prefix="cf_video_", suffix=".mp4", dir=OUT_DIR)
+        os.close(fdv)
+        await message.video.download(destination_file=tmp_video)
+        _set_last_video(bot_state, message.chat.id, tmp_video)
+
+        # 2) извлечь кадр
+        frame_jpg = str(Path(tmp_video).with_suffix(".jpg"))
+        if not _try_ffmpeg_frame(tmp_video, frame_jpg):
+            raise RuntimeError("ffmpeg frame extract failed")
+
+        jpath = _reencode_to_jpeg(frame_jpg)
+        path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, caption or "", dur)
+        log.info("[ui] video->frame I2V OK: %s", path)
+
+    except Exception as e:
+        log.warning("[ui] video flow failed: %s — fallback offline", e)
+        path = await loop.run_in_executor(None, _offline.generate, caption, dur)
+    finally:
+        if frame_jpg and os.path.exists(frame_jpg):
+            try:
+                os.remove(frame_jpg)
+            except Exception:
+                pass
+
+    _store_preview_and_reply_path(bot_state, message.chat.id, path)
+    with open(path, "rb") as f:
+        await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready(dur))
+
+
+# ---------- CALLBACKS ----------
+
+async def handle_callback(query: types.CallbackQuery, bot_state):
+    _ensure_clients()
+    _ensure_state(bot_state)
+    data = (query.data or "").strip()
+    chat_id = query.message.chat.id if query.message else None
+
+    await _ack_cb(query)
+
+    # выбор длительности — мини-меню
+    if data == "choose_duration":
+        cur = _get_current_duration(bot_state, chat_id)
+        await query.message.answer("Выбери длительность:", reply_markup=kb_choose_duration(cur))
+        return
+
+    if data == "dur_5":
+        _set_current_duration(bot_state, chat_id, 5)
+        await query.message.answer("⏱ Длительность установлена: 5 сек.")
+        return
+
+    if data == "dur_10":
+        _set_current_duration(bot_state, chat_id, 10)
+        await query.message.answer("⏱ Длительность установлена: 10 сек.")
+        return
+
+    if data == "again":
+        await query.message.answer("🛠 Генерирую превью…")
+        last_img = _get_last_image(bot_state, chat_id)
+        prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
+        loop = asyncio.get_event_loop()
+        dur = _get_current_duration(bot_state, chat_id)
+        try:
+            if last_img and os.path.exists(last_img):
+                jpath = _reencode_to_jpeg(last_img)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, prompt, dur)
+                log.info("[ui] again(photo) OK: %s", path)
+            else:
+                path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, dur)
+                log.info("[ui] again(text) OK: %s", path)
+        except Exception as e:
+            log.warning("[ui] again failed: %s — fallback offline", e)
+            path = await loop.run_in_executor(None, _offline.generate, prompt, dur)
+
+        _store_preview_and_reply_path(bot_state, chat_id, path)
+        with open(path, "rb") as f:
+            await query.message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready(dur))
+        return
+
+    if data == "sora2_go":
+        # Приоритет источника:
+        # 1) крайнее ВИДЕО пользователя -> кадр -> I2V
+        # 2) крайняя ФОТО
+        # 3) крайняя ПРЕВЬЮШКА (mp4, кадр)
+        # 4) крайний ТЕКСТ
+        await query.message.answer("🧩 Генерирую SORA 2…")
+
+        loop = asyncio.get_event_loop()
+        dur = _get_current_duration(bot_state, chat_id)
+        prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
+
+        last_video = _get_last_video(bot_state, chat_id)
+        last_img = _get_last_image(bot_state, chat_id)
+        last_prev = _get_last_preview(bot_state, chat_id)
+
+        try:
+            if last_video and os.path.exists(last_video):
+                frame = str(Path(last_video).with_suffix(".jpg"))
+                if not _try_ffmpeg_frame(last_video, frame):
+                    raise RuntimeError("sora2: frame from last_video failed")
+                jpath = _reencode_to_jpeg(frame)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, prompt, dur)
+                log.info("[ui] sora2(video->frame) OK: %s", path)
+
+            elif last_img and os.path.exists(last_img):
+                jpath = _reencode_to_jpeg(last_img)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, prompt, dur)
+                log.info("[ui] sora2(photo) OK: %s", path)
+
+            elif last_prev and os.path.exists(last_prev):
+                frame = str(Path(last_prev).with_suffix(".jpg"))
+                if not _try_ffmpeg_frame(last_prev, frame):
+                    raise RuntimeError("sora2: frame from last_preview failed")
+                jpath = _reencode_to_jpeg(frame)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, prompt, dur)
+                log.info("[ui] sora2(prev->frame) OK: %s", path)
+
+            else:
+                path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, dur)
+                log.info("[ui] sora2(text) OK: %s", path)
+
+        except Exception as e:
+            log.warning("[ui] sora2 failed: %s — fallback offline", e)
+            path = await loop.run_in_executor(None, _offline.generate, prompt, dur)
+
+        _store_preview_and_reply_path(bot_state, chat_id, path)
+        with open(path, "rb") as f:
+            await query.message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready(dur))
+        return
+
+    if data == "photo_help":
+        await query.message.answer("Пришли фото (или документ с картинкой) и подпись — сделаю ролик.")
+        return
+
+    if data == "video_help":
+        await query.message.answer("Пришли короткое видео и подпись — сделаю ролик.")
+        return
+
+    return

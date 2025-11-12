@@ -1,0 +1,55 @@
+import os, logging
+from typing import List
+log = logging.getLogger("provider")
+
+async def _try_kie(prompt, n, out_dir):
+    if os.getenv("KIE_DISABLE") == "1":
+        raise RuntimeError("KIE disabled via env")
+    api_key = os.getenv("KIEAI_API_KEY") or os.getenv("KIE_API_KEY")
+    if not api_key:
+        raise RuntimeError("KIE key missing")
+    from .kie_ai import KIEClient
+    client = KIEClient()
+    return await client.generate(prompt, n, out_dir)
+
+async def _try_luma(prompt, n, out_dir):
+    from .luma_adapter import LumaClient
+    client = LumaClient.from_env()     # поднимет исключение, если нет ключей/урлов
+    return await client.generate(prompt, n, out_dir)
+
+async def _try_runway(prompt, n, out_dir):
+    from .runway_adapter import RunwayClient
+    client = RunwayClient.from_env()   # поднимет исключение, если нет ключей/урлов
+    return await client.generate(prompt, n, out_dir)
+
+def _try_ffmpeg(prompt, n, out_dir):
+    from .ffmpeg_stub import render_many
+    return render_many(prompt, n, out_dir=out_dir)
+
+PROVIDER_FUNCS = {
+    "kie": _try_kie,
+    "luma": _try_luma,
+    "runway": _try_runway,
+    "ffmpeg": _try_ffmpeg,
+}
+
+async def render_videos(prompt: str, n: int, out_dir: str) -> List[str]:
+    order = os.getenv("PROVIDERS", "ffmpeg").lower().replace(" ", "").split(",")
+    last_error = None
+    for name in order:
+        if name not in PROVIDER_FUNCS:
+            log.warning("PROVIDER: unknown '%s' in PROVIDERS, skipping", name)
+            continue
+        try:
+            log.info("PROVIDER: trying %s", name.upper())
+            fn = PROVIDER_FUNCS[name]
+            files = await fn(prompt, n, out_dir) if "async" in getattr(fn, "__code__", None).__repr__() else fn(prompt, n, out_dir)
+            os.environ["_LAST_PROVIDER"] = name.upper()
+            log.info("PROVIDER: %s OK -> %r", name.upper(), files)
+            return files
+        except Exception as e:
+            log.exception("PROVIDER: %s failed, fallback to next", name.upper())
+            last_error = e
+            continue
+    # если никто не отдал — завершаем ошибкой
+    raise RuntimeError(f"All providers failed: {last_error}")

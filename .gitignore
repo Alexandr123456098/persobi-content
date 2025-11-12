@@ -1,0 +1,32 @@
+# venv / cache
+.venv/
+__pycache__/
+*.pyc
+
+# build/output
+out/
+dist/
+build/
+
+# logs/tmp
+*.log
+tmp/
+cache/
+
+# secrets
+.env
+*.env
+**/*.env
+secrets/
+**/secrets/**
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+*.p12
+*.crt
+*.der
+token*
+*apikey*
+*api_key*

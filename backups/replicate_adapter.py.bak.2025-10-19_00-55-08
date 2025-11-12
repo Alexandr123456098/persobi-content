@@ -1,0 +1,91 @@
+import os, asyncio, aiohttp, logging, pathlib, time
+from typing import List, Optional
+
+log = logging.getLogger(__name__)
+REPL_API = "https://api.replicate.com/v1"
+
+def _out_path(out_dir: str, suffix: str = ".mp4") -> str:
+    p = pathlib.Path(out_dir); p.mkdir(parents=True, exist_ok=True)
+    return str(p / f"cf_{int(time.time())}_{os.urandom(3).hex()}{suffix}")
+
+class ReplicateClient:
+    def __init__(self, token: str, version: str):
+        if not token:
+            raise RuntimeError("REPLICATE_API_TOKEN is empty")
+        if not version:
+            raise RuntimeError("REPLICATE_MODEL_VERSION is empty")
+        self.token = token
+        self.version = version
+        self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            os.getenv("REPLICATE_API_TOKEN","").strip(),
+            os.getenv("REPLICATE_MODEL_VERSION","").strip(),
+        )
+
+    async def _post(self, s: aiohttp.ClientSession, url: str, payload: dict) -> dict:
+        async with s.post(url, json=payload, headers=self.headers) as r:
+            txt = await r.text()
+            if r.status >= 300:
+                raise RuntimeError(f"POST {url} {r.status}: {txt}")
+            return await r.json()
+
+    async def _get(self, s: aiohttp.ClientSession, url: str) -> dict:
+        async with s.get(url, headers=self.headers) as r:
+            txt = await r.text()
+            if r.status >= 300:
+                raise RuntimeError(f"GET {url} {r.status}: {txt}")
+            return await r.json()
+
+    async def _download(self, s: aiohttp.ClientSession, url: str, out_path: str) -> str:
+        async with s.get(url) as r:
+            if r.status >= 300:
+                raise RuntimeError(f"DOWNLOAD {url} {r.status}")
+            with open(out_path, "wb") as f:
+                while True:
+                    chunk = await r.content.read(1<<20)
+                    if not chunk: break
+                    f.write(chunk)
+        return out_path
+
+    async def generate(self, prompt: str, n: int, out_dir: str) -> List[str]:
+        fps = int(os.getenv("VIDEO_FPS","24"))
+        dur = int(os.getenv("VIDEO_DURATION","6"))
+        inputs = {"prompt": prompt, "fps": fps, "duration": dur}
+        outs: List[str] = []
+        async with aiohttp.ClientSession() as s:
+            for _ in range(max(1, n)):
+                create = await self._post(s, f"{REPL_API}/predictions", {
+                    "version": self.version,
+                    "input": inputs
+                })
+                pid = create.get("id")
+                if not pid:
+                    raise RuntimeError(f"Replicate create: no id in {create}")
+                url = f"{REPL_API}/predictions/{pid}"
+                for _i in range(600):
+                    cur = await self._get(s, url)
+                    st = cur.get("status")
+                    if st in ("succeeded","failed","canceled"):
+                        if st != "succeeded":
+                            raise RuntimeError(f"Replicate status={st} id={pid}")
+                        output = cur.get("output")
+                        if not output:
+                            raise RuntimeError(f"Replicate no output id={pid}")
+                        url_out: Optional[str] = None
+                        if isinstance(output, list):
+                            for c in output:
+                                if isinstance(c, str) and (c.endswith(".mp4") or c.startswith("http")):
+                                    url_out = c; break
+                        elif isinstance(output, str):
+                            url_out = output
+                        if not url_out:
+                            raise RuntimeError("Replicate output has no downloadable url")
+                        outs.append(await self._download(s, url_out, _out_path(out_dir, ".mp4")))
+                        break
+                    await asyncio.sleep(1.0)
+                else:
+                    raise RuntimeError(f"Replicate timeout id={pid}")
+        return outs

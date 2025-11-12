@@ -1,0 +1,90 @@
+import os, asyncio, aiohttp, logging, pathlib, time
+from typing import List, Dict, Any
+
+log = logging.getLogger(__name__)
+REPL_API = "https://api.replicate.com/v1"
+
+def _out_path(out_dir: str, suffix: str = ".mp4") -> str:
+    p = pathlib.Path(out_dir); p.mkdir(parents=True, exist_ok=True)
+    return str(p / f"cf_{int(time.time())}_{os.urandom(4).hex()}{suffix}")
+
+class ReplicateClient:
+    def __init__(self, token: str, version: str):
+        if not token:
+            raise RuntimeError("REPLICATE_API_TOKEN is empty")
+        if not version:
+            raise RuntimeError("REPLICATE_MODEL_VERSION is empty")
+        self.token = token
+        self.version = version
+        self.headers = {"Authorization": f"Token {self.token}", "Content-Type": "application/json"}
+
+    @classmethod
+    def from_env(cls) -> "ReplicateClient":
+        return cls(
+            os.getenv("REPLICATE_API_TOKEN", ""),
+            os.getenv("REPLICATE_MODEL_VERSION", "")
+        )
+
+    async def _post(self, s: aiohttp.ClientSession, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        async with s.post(url, json=payload, headers=self.headers, timeout=600) as r:
+            txt = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"POST {url} {r.status}: {txt}")
+            return await r.json()
+
+    async def _get(self, s: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
+        async with s.get(url, headers=self.headers, timeout=600) as r:
+            txt = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"GET {url} {r.status}: {txt}")
+            return await r.json()
+
+    async def _download(self, s: aiohttp.ClientSession, url: str, out_path: str) -> str:
+        async with s.get(url, timeout=1800) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                async for chunk in r.content.iter_chunked(1<<15):
+                    f.write(chunk)
+        return out_path
+
+    async def generate(self, prompt: str, n: int, out_dir: str) -> List[str]:
+        width  = int(os.getenv("VIDEO_WIDTH", "1280"))
+        height = int(os.getenv("VIDEO_HEIGHT", "720"))
+        fps    = int(os.getenv("VIDEO_FPS", "24"))
+        dur    = int(os.getenv("VIDEO_DURATION", "6"))
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+
+        # Sora-2 на Replicate требует openai_api_key в input
+        inputs: Dict[str, Any] = {
+            "prompt": prompt,
+            "width": width, "height": height,
+            "fps": fps, "duration": dur,
+        }
+        if openai_key:
+            inputs["openai_api_key"] = openai_key
+
+        out_files: List[str] = []
+        async with aiohttp.ClientSession() as s:
+            for _ in range(max(1, n)):
+                create = await self._post(s, f"{REPL_API}/predictions", {"version": self.version, "input": inputs})
+                pid = create.get("id"); get_url = create.get("urls", {}).get("get")
+                if not pid or not get_url:
+                    raise RuntimeError(f"Unexpected create response: {create}")
+
+                # poll
+                for _i in range(360):
+                    j = await self._get(s, get_url)
+                    st = j.get("status")
+                    if st in ("succeeded","failed","canceled"):
+                        if st != "succeeded":
+                            raise RuntimeError(f"Replicate status={st} id={pid}")
+                        output = j.get("output")
+                        urls = output if isinstance(output, list) else [output]
+                        out_path = _out_path(out_dir, ".mp4")
+                        await self._download(s, urls[0], out_path)
+                        out_files.append(out_path)
+                        break
+                    await asyncio.sleep(5)
+                else:
+                    raise RuntimeError(f"Timeout waiting replicate id={pid}")
+        return out_files

@@ -1,0 +1,40 @@
+from aiogram import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import os, asyncio
+from app.adapters.offline_adapter import OfflineClient
+
+OUT_DIR = os.environ.get("OUT_DIR", "/opt/content_factory/out")
+offline = OfflineClient(OUT_DIR)
+
+def kb_ready():
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.row(
+        InlineKeyboardButton("🔁 Ещё раз", callback_data="again"),
+        InlineKeyboardButton("📐 720p↔1080p", callback_data="toggle_res"),
+        InlineKeyboardButton("🟩 4K", callback_data="make_4k"),
+    )
+    return kb
+
+async def handle_text(message: types.Message, state):
+    prompt = (message.text or "").strip()
+    if not prompt:
+        return
+    m = await message.answer("🛠 Генерирую превью…")
+
+    # Генерируем офлайн-превью
+    path = await offline.generate_video(prompt, seconds=5)
+    caption = "✅ Готово. Предпросмотр"
+    await message.answer_video(open(path, "rb"), caption=caption, reply_markup=kb_ready())
+    await m.delete()
+
+async def handle_callback(query: types.CallbackQuery, state):
+    data = query.data
+    if data == "again":
+        await query.answer("🔁 Ещё раз")
+        path = await offline.generate_video("повторный рендер", seconds=5)
+        caption = "✅ Готово. Предпросмотр "
+        await query.message.answer_video(open(path, "rb"), caption=caption, reply_markup=kb_ready())
+    elif data == "toggle_res":
+        await query.answer("📐 Переключил разрешение (демо)")
+    elif data == "make_4k":
+        await query.answer("🟩 Подготавливаю 4K (через Luma/Replicate)")

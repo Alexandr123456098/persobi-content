@@ -1,0 +1,155 @@
+import os
+import asyncio
+import logging
+from typing import Dict, Optional
+
+from aiogram import Bot, Dispatcher, Router, F, F
+from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+
+import httpx
+
+# --- env ----------------------------------------------------------------------
+from dotenv import load_dotenv
+load_dotenv("/opt/content_factory/.env")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OUT_DIR = os.getenv("OUT_DIR", "/opt/content_factory/out")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("bot")
+LOG.info(
+    "ENV CHECK: BOT_TOKEN=%s, OPENAI=%s, MODEL=%s, OUT_DIR=%s",
+    (BOT_TOKEN[:8] + "..." if BOT_TOKEN else "EMPTY"),
+    "SET" if OPENAI_API_KEY else "EMPTY",
+    OPENAI_MODEL,
+    OUT_DIR,
+)
+
+# --- state --------------------------------------------------------------------
+# Сохраняем последний сгенерённый промпт по чату
+LAST_PROMPT: Dict[int, str] = {}
+
+# --- helpers ------------------------------------------------------------------
+async def call_openai(system: str, user: str) -> str:
+    """Берём режиссёрский промпт у OpenAI (chat.completions)."""
+    if not OPENAI_API_KEY:
+        return "🔧 OPENAI_API_KEY не задан. Использую текст как есть."
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 700,
+    }
+    async with httpx.AsyncClient(timeout=60) as cli:
+        r = await cli.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+# простой заглушечный рендерер (у нас он лежит в adapters/ffmpeg_stub.py)
+from adapters import render_videos
+
+# --- bot wiring ---------------------------------------------------------------
+dp = Dispatcher()
+router = Router()
+
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    await m.answer(
+        "Я соберу режиссёрский промпт и сделаю черновое видео.\n"
+        "Напиши идею (можно с фото)."
+    )
+
+@dp.message(F.text & ~F.text.in_({"1", "2", "3"}))
+async def on_text(m: Message):
+    chat_id = m.chat.id
+    text = m.text or ""
+    LOG.info("Incoming text chat_id=%s text=%r", chat_id, text)
+
+    system = (
+        "Ты режиссёр. Возвращай один структурированный промпт для видео "
+        "с блоками: Scene / Setting / Subjects / Action / Camera / Lighting / Mood / Details. "
+        "Никаких пояснений."
+    )
+    prompt = await call_openai(system, text) if text else "A nice short scene."
+
+    LAST_PROMPT[chat_id] = prompt
+
+    await m.answer(
+        "Вот твой режиссёрский промпт (копируй куда хочешь):\n\n"
+        f"{prompt}\n\nСколько видео сделать: 1, 2 или 3?"
+    )
+
+@dp.message(F.text.in_({"1", "2", "3"}))
+async def on_choose_count(m: Message):
+    chat_id = m.chat.id
+    n = int(m.text.strip())
+    prompt = LAST_PROMPT.get(chat_id)
+    if not prompt:
+        await m.answer("Сначала пришли идею, я соберу промпт 😉")
+        return
+
+    LOG.info("Render start chat_id=%s n=%s", chat_id, n)
+    await m.answer(f"Окей, рендерю {n} видео… (черновики)")
+
+    try:
+        files = await render_videos(prompt, n, OUT_DIR)
+        LOG.info("Render done files=%r", files)
+        for path in files:
+            # ВАЖНО: в aiogram v3 нужно передавать FSInputFile
+            video = FSInputFile(path)
+            kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔁 Сделать 4K в Luma (платно)", callback_data="upscale_luma"))
+            await m.answer_video(video, caption=f"Черновик · провайдер: {os.getenv('_LAST_PROVIDER','FFMPEG')}", reply_markup=kb)
+    except Exception as e:
+        LOG.exception("send_video error")
+        await m.answer(f"Не удалось отправить видео: {e}")
+
+
+@router.callback_query(F.data == "upscale_luma")
+async def on_upscale_luma(cq):
+    import os
+    try:
+        chat_id = cq.message.chat.id
+    except Exception:
+        await cq.answer("Не получилось определить чат", show_alert=True)
+        return
+    prompt = LAST_PROMPT.get(chat_id)
+    if not prompt:
+        await cq.answer("Не нашёл исходный промпт, пришли идею заново", show_alert=True)
+        return
+    await cq.answer("Делаю 4K через Luma…")
+    os.environ["_PROVIDERS_ONCE"] = "luma,ffmpeg"
+    os.environ["VIDEO_WIDTH"] = "3840"
+    os.environ["VIDEO_HEIGHT"] = "2160"
+    try:
+        files = await render_videos(prompt, 1, OUT_DIR)
+        video = FSInputFile(files[0])
+        await cq.message.answer_video(video, caption="4K · провайдер: LUMA")
+    except Exception as e:
+        LOG.exception("luma upscale failed: %s", e)
+        await cq.message.answer(f"Не удалось сделать 4K: {e}")
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN пуст — задайте в .env")
+    bot = Bot(BOT_TOKEN)
+    dp.include_router(router)
+    LOG.info(\"Start polling\")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import uvloop
+    uvloop.install()
+    asyncio.run(main())

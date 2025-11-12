@@ -1,0 +1,53 @@
+import os
+import re
+import time
+import asyncio
+import ffmpeg
+
+class OfflineClient:
+    """
+    Простой офлайн-генератор: делает 5-секундный mp4 (чёрный фон, 1280x720, 30fps, AAC).
+    Нужен для стабильного пайплайна без внешних API.
+    """
+    def __init__(self, out_dir: str | None = None):
+        self.out_dir = out_dir or os.getenv("OUT_DIR", "/opt/content_factory/out")
+        os.makedirs(self.out_dir, exist_ok=True)
+
+    async def generate_video(self, prompt: str, seconds: int = 5,
+                             width: int = 1280, height: int = 720, fps: int = 30) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", prompt).strip("_")[:40] or "clip"
+        dst = os.path.join(self.out_dir, f"offline_{int(time.time())}_{safe}.mp4")
+
+        def _build():
+            # Чёрный фон (видео) + тишина (аудио), быстрые пресеты для экономии времени
+            v = ffmpeg.input(f"color=black:s={width}x{height}:d={seconds}", f="lavfi", r=fps)
+            a = ffmpeg.input("anullsrc=r=48000:cl=stereo", f="lavfi")
+            (
+                ffmpeg
+                .output(
+                    v, a, dst,
+                    vcodec="libx264", preset="veryfast", crf=23, pix_fmt="yuv420p",
+                    acodec="aac", audio_bitrate="128k", movflags="+faststart"
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return dst
+
+        return await asyncio.to_thread(_build)
+
+class ReplicateClient:
+    """
+    Заглушка под Replicate. Конструктор совместим с bot.py:
+    принимает model_slug ИЛИ model, игнорирует лишние kwargs.
+    """
+    def __init__(self, model_slug: str | None = None, model: str | None = None,
+                 token: str | None = None, out_dir: str | None = None, **_):
+        self.model = model or model_slug or os.getenv("REPLICATE_MODEL")
+        self.token = token or os.getenv("REPLICATE_API_TOKEN")
+        self.out_dir = out_dir or os.getenv("OUT_DIR", "/opt/content_factory/out")
+        os.makedirs(self.out_dir, exist_ok=True)
+
+    async def generate_video(self, prompt: str) -> str:
+        # Реальный вызов Replicate подключим позже
+        raise RuntimeError("Replicate не сконфигурирован (используем offline).")

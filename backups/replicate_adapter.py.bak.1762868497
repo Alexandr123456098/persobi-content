@@ -1,0 +1,257 @@
+# -*- coding: utf-8 -*-
+"""
+replicate_adapter.py — профиль A: WAN 2.2 Fast → ровно 7.5 s @ 16 fps, upscale до 720p.
+Без fallback. Поддержка T2V (text→video) и I2V (image→video) с одинаковой длительностью.
+
+Требования окружения:
+  REPLICATE_API_TOKEN   — токен Replicate (лежит в /opt/content_factory/.env)
+Опционально:
+  OUT_DIR               — каталог вывода (по умолчанию /opt/content_factory/out)
+
+Логика:
+  1) Для T2V используем модель "wan-video/wan-2.2-t2v-fast".
+     Для I2V используем модель "wan-video/wan-2.2-i2v-fast".
+  2) Всегда подаём num_frames=121, frames_per_second=16.
+  3) Качаем output, нормализуем длительность до ровно 7.5 s:
+       - если короче → дополняем клонированием последнего кадра (tpad),
+       - если длиннее → обрезаем до 7.5.
+     Всегда приводим fps=16 и делаем upscale до 720p (Lanczos).
+  4) Возвращаем { "path": ..., "seconds": 7.5, "fps": 16, "profile": "wanA_7_5s" }.
+
+Примечание по надёжности:
+  Некоторые версии WAN могут вернуть ролик ~5.07 s. Нормализатор принудительно
+  доведёт до 7.5 s, чтобы интерфейс и поведение были стабильными.
+"""
+
+import os
+import time
+import json
+import tempfile
+import subprocess
+from urllib.request import urlopen
+
+# Жёсткие параметры профиля A
+PROFILE_NAME = "wanA_7_5s"
+TARGET_SECONDS = 7.5
+FPS = 16
+NUM_FRAMES = 121
+
+T2V_MODEL = os.getenv("REPLICATE_MODEL_WAN_T2V", "wan-video/wan-2.2-t2v-fast")
+I2V_MODEL = os.getenv("REPLICATE_MODEL_WAN_I2V", "wan-video/wan-2.2-i2v-fast")
+REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+OUT_DIR = os.getenv("OUT_DIR", "/opt/content_factory/out").rstrip("/")
+
+API_BASE = "https://api.replicate.com/v1"
+
+class ReplicateError(RuntimeError):
+    pass
+
+def _ensure_outdir():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+def _ffprobe_duration(path: str) -> float:
+    """Вернуть длительность файла в секундах (float)."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        path
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    r.check_returncode()
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def _post_json(url: str, data: dict) -> dict:
+    if not REPLICATE_TOKEN:
+        raise ReplicateError("REPLICATE_API_TOKEN пуст. Проверь /opt/content_factory/.env")
+    req = subprocess.run(
+        [
+            "curl", "-fsS",
+            "-H", f"Authorization: Token {REPLICATE_TOKEN}",
+            "-H", "Content-Type: application/json",
+            "-X", "POST", url,
+            "-d", json.dumps(data, ensure_ascii=False)
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if req.returncode != 0:
+        raise ReplicateError(f"POST {url} failed: {req.stderr}")
+    return json.loads(req.stdout)
+
+def _get_json(url: str) -> dict:
+    if not REPLICATE_TOKEN:
+        raise ReplicateError("REPLICATE_API_TOKEN пуст. Проверь /opt/content_factory/.env")
+    req = subprocess.run(
+        ["curl", "-fsS", "-H", f"Authorization: Token {REPLICATE_TOKEN}", url],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if req.returncode != 0:
+        raise ReplicateError(f"GET {url} failed: {req.stderr}")
+    return json.loads(req.stdout)
+
+def _download(url: str, out_path: str):
+    # Без внешних зависимостей
+    with urlopen(url) as r, open(out_path, "wb") as f:
+        f.write(r.read())
+
+def _normalize_7_5s_and_upscale(src_path: str) -> str:
+    """Привести к точно 7.5 s, fps=16 и upscale до 720p (Lanczos)."""
+    dur = _ffprobe_duration(src_path)
+    tmp_path = src_path + ".norm.tmp.mp4"
+    final_path = src_path + ".final.mp4"
+
+    # Всегда нормализуем: фиксированный fps=16 и высота 720.
+    vf_base = f"fps={FPS},scale=-2:720:flags=lanczos"
+
+    if dur <= 0:
+        # Дефенсивно — просто прогнать фильтры и ограничить по времени
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf_base,
+            "-r", str(FPS),
+            "-t", f"{TARGET_SECONDS:.3f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            tmp_path
+        ]
+        subprocess.run(cmd, check=True)
+    elif dur < TARGET_SECONDS - 0.01:
+        pad = TARGET_SECONDS - dur
+        # Клонируем последний кадр до нужной длительности
+        vf = f"{vf_base},tpad=stop_mode=clone:stop_duration={pad:.3f}"
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf,
+            "-r", str(FPS),
+            "-t", f"{TARGET_SECONDS:.3f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            tmp_path
+        ]
+        subprocess.run(cmd, check=True)
+    else:
+        # Дольше нужного — просто обрежем до 7.5 s
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf_base,
+            "-r", str(FPS),
+            "-t", f"{TARGET_SECONDS:.3f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            tmp_path
+        ]
+        subprocess.run(cmd, check=True)
+
+    # Переименуем
+    if os.path.exists(final_path):
+        os.remove(final_path)
+    os.replace(tmp_path, final_path)
+    return final_path
+
+def _run_prediction(model: str, input_dict: dict) -> str:
+    """
+    Создаёт prediction, ждёт завершения и возвращает URL медиа (str).
+    """
+    create = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": input_dict})
+    urls = create.get("urls") or {}
+    get_url = urls.get("get")
+    if not get_url:
+        raise ReplicateError(f"Нет urls.get в ответе create: {create}")
+
+    # Поллинг
+    while True:
+        resp = _get_json(get_url)
+        st = resp.get("status")
+        if st == "succeeded":
+            out = resp.get("output")
+            if isinstance(out, list) and out:
+                return out[-1]
+            if isinstance(out, str) and out:
+                return out
+            raise ReplicateError(f"Пустой output в succeeded: {resp}")
+        if st == "failed":
+            raise ReplicateError(f"Prediction failed: {resp}")
+        time.sleep(2)
+
+class Adapter:
+    """
+    Унифицированный адаптер под бота.
+    Методы:
+      - text(prompt: str) -> dict
+      - image(image_path: str, prompt: str|None=None) -> dict
+    Возвращает словарь: {"path": str, "seconds": 7.5, "fps": 16, "profile": "wanA_7_5s"}
+    """
+
+    def __init__(self):
+        _ensure_outdir()
+
+    def _common_input(self, prompt: str | None, image_url: str | None = None) -> dict:
+        # Жёсткая подача кадров/фпс для стабильной длительности ~7.5 s
+        inp = {
+            "num_frames": NUM_FRAMES,
+            "frames_per_second": FPS
+        }
+        if prompt:
+            inp["prompt"] = prompt
+        if image_url:
+            inp["image"] = image_url
+        return inp
+
+    def text(self, prompt: str) -> dict:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ReplicateError("text(): пустой prompt")
+        inp = self._common_input(prompt=prompt.strip(), image_url=None)
+        media_url = _run_prediction(T2V_MODEL, inp)
+
+        base = os.path.join(OUT_DIR, f"replicate_wanA_t2v_{int(time.time())}.mp4")
+        tmp = base + ".dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = _normalize_7_5s_and_upscale(tmp)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"path": final_path, "seconds": TARGET_SECONDS, "fps": FPS, "profile": PROFILE_NAME}
+
+    def image(self, image_path: str, prompt: str | None = None) -> dict:
+        if not isinstance(image_path, str) or not os.path.exists(image_path):
+            # Допускаем URL с протоколом file:/ или http(s)
+            if not (isinstance(image_path, str) and (image_path.startswith("file:") or image_path.startswith("http"))):
+                raise ReplicateError(f"image(): не найден файл/URL: {image_path}")
+
+        image_url = image_path
+        # Если пришёл обычный локальный путь — превратим в file:/abs/path
+        if os.path.exists(image_path):
+            image_url = "file:" + os.path.abspath(image_path)
+
+        inp = self._common_input(prompt=(prompt or "").strip() or None, image_url=image_url)
+        media_url = _run_prediction(I2V_MODEL, inp)
+
+        base = os.path.join(OUT_DIR, f"replicate_wanA_i2v_{int(time.time())}.mp4")
+        tmp = base + ".dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = _normalize_7_5s_and_upscale(tmp)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"path": final_path, "seconds": TARGET_SECONDS, "fps": FPS, "profile": PROFILE_NAME}
+
+# Для ручного CLI-прогона:
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["text", "image"], required=True)
+    ap.add_argument("--prompt", default="Cinematic dolly shot across a sunlit living room, fireplace glow, soft volumetric light")
+    ap.add_argument("--image", default="")
+    args = ap.parse_args()
+
+    ad = Adapter()
+    if args.mode == "text":
+        res = ad.text(args.prompt)
+    else:
+        if not args.image:
+            raise SystemExit("Нужно --image для mode=image")
+        res = ad.image(args.image, args.prompt)
+
+    print(json.dumps(res, ensure_ascii=False))

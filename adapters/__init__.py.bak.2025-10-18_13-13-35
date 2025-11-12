@@ -1,0 +1,101 @@
+import os
+import logging
+from typing import List
+
+logger = logging.getLogger(__name__)
+
+# --- LUMA (включим, когда появится ключ) ---
+try:
+    from .luma_adapter import LumaClient
+except Exception:
+    LumaClient = None
+
+# --- RUNWAY (включим, когда появится ключ) ---
+try:
+    from .runway_adapter import RunwayClient
+except Exception:
+    RunwayClient = None
+
+
+def _ffmpeg_generate_sync(prompt: str, n: int, out_dir: str) -> List[str]:
+    """
+    Универсальная обёртка под твой ffmpeg_stub.render_many(...)
+    """
+    try:
+        from .ffmpeg_stub import render_many
+    except Exception as e:
+        raise RuntimeError(f"ffmpeg_stub missing render_many(): {e}")
+
+    files = render_many(prompt=prompt, count=n, out_dir=out_dir)
+    if not isinstance(files, list):
+        files = [files]
+    return files
+
+
+# ---------------- Providers ----------------
+
+async def _try_luma(prompt: str, n: int, out_dir: str) -> List[str]:
+    if os.getenv("LUMA_API_KEY", "").strip() == "":
+        raise RuntimeError("LUMA_API_KEY is empty")
+    if LumaClient is None:
+        raise RuntimeError("LumaClient not available")
+
+    client = LumaClient.from_env()   # должен бросить исключение, если конфиг неполный
+    files = await client.generate(prompt, n, out_dir)  # ВАЖНО: await!
+    if not isinstance(files, list):
+        raise RuntimeError(f"Luma returned non-list: {type(files)}")
+    return files
+
+
+async def _try_runway(prompt: str, n: int, out_dir: str) -> List[str]:
+    if os.getenv("RUNWAY_API_KEY", "").strip() == "":
+        raise RuntimeError("RUNWAY_API_KEY is empty")
+    if RunwayClient is None:
+        raise RuntimeError("RunwayClient not available")
+
+    client = RunwayClient.from_env()
+    files = await client.generate(prompt, n, out_dir)  # ВАЖНО: await!
+    if not isinstance(files, list):
+        raise RuntimeError(f"Runway returned non-list: {type(files)}")
+    return files
+
+
+async def _try_ffmpeg(prompt: str, n: int, out_dir: str) -> List[str]:
+    return _ffmpeg_generate_sync(prompt, n, out_dir)
+
+
+# ---------------- Orchestrator ----------------
+
+async def render_videos(prompt: str, n: int, out_dir: str) -> List[str]:
+    """
+    Перебираем провайдеры в порядке PROVIDERS (например: ffmpeg или luma,ffmpeg).
+    Возвращаем список путей к mp4.
+    """
+    providers_order = os.getenv("PROVIDERS", "ffmpeg").split(",")
+    providers_order = [p.strip().lower() for p in providers_order if p.strip()]
+
+    name2fn = {
+        "luma": _try_luma,
+        "runway": _try_runway,
+        "ffmpeg": _try_ffmpeg,
+    }
+
+    last_error = None
+    for name in providers_order:
+        fn = name2fn.get(name)
+        if not fn:
+            logger.warning("Unknown provider in PROVIDERS: %s", name)
+            continue
+
+        os.environ["_LAST_PROVIDER"] = name.upper()
+        try:
+            logger.info("PROVIDER=%s start", name.upper())
+            files = await fn(prompt, n, out_dir)   # ВАЖНО: await провайдера
+            if files:
+                logger.info("PROVIDER=%s ok: %s", name.upper(), files)
+                return files
+        except Exception as e:
+            last_error = e
+            logger.exception("PROVIDER=%s failed: %s", name.upper(), e)
+
+    raise RuntimeError(f"All providers failed. Last error: {last_error}")

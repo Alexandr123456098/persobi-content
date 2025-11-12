@@ -1,0 +1,30 @@
+[
+  {
+    "slug": "wan-video/wan-2.5-i2v-fast",
+    "status": 200,
+    "ok": false,
+    "latest_version": null,
+    "note": "parse error: 'str' object has no attribute 'get'"
+  },
+  {
+    "slug": "wan-video/wan-2.2-i2v-fast",
+    "status": 200,
+    "ok": false,
+    "latest_version": null,
+    "note": "parse error: 'str' object has no attribute 'get'"
+  },
+  {
+    "slug": "tencent/hunyuan-video",
+    "status": 200,
+    "ok": false,
+    "latest_version": null,
+    "note": "parse error: 'str' object has no attribute 'get'"
+  },
+  {
+    "slug": "kwaivgi/kling-v2.1",
+    "status": 200,
+    "ok": false,
+    "latest_version": null,
+    "note": "parse error: 'str' object has no attribute 'get'"
+  }
+]

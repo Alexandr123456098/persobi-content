@@ -1,0 +1,88 @@
+from aiogram import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import os, asyncio
+
+# Берём оба клиента: Replicate — основной, Offline — на подстраховку
+from app.adapters import ReplicateClient
+from app.adapters.offline_adapter import OfflineClient
+
+OUT_DIR = os.environ.get("OUT_DIR","/opt/content_factory/out")
+replicate = ReplicateClient(OUT_DIR)
+offline = OfflineClient(OUT_DIR)
+
+def kb_ready():
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.row(
+        InlineKeyboardButton("🔁 Ещё раз", callback_data="again"),
+        InlineKeyboardButton("📐 720p/1080p", callback_data="toggle_res"),
+        InlineKeyboardButton("🟩 4K", callback_data="make_4k"),
+    )
+    return kb
+
+async def _gen_replicate(prompt: str, seconds: int = 5):
+    # ReplicateClient.generate — синхронный; уводим в executor, чтобы не блокировать бота
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, replicate.generate, prompt, seconds)
+
+async def handle_text(message: types.Message, state):
+    prompt = (message.text or "").strip()
+    if not prompt:
+        return
+    wait = await message.answer("🛠 Генерирую…")
+    try:
+        # Пытаемся сгенерить в Replicate
+        path = await _gen_replicate(prompt, 5)
+        await message.answer_video(open(path,"rb"),
+                                   caption="✅ Готово. Предпросмотр: 720p, 5 сек.",
+                                   reply_markup=kb_ready())
+    except Exception as e:
+        # Фолбэк на офлайн, если репликейт ляжет
+        try:
+            p2 = await offline.generate_video(prompt, seconds=5)
+            await message.answer_video(open(p2,"rb"),
+                                       caption="✅ Готово. Предпросмотр: 720p, 5 сек. (offline)",
+                                       reply_markup=kb_ready())
+        except Exception as e2:
+            await message.answer(f"❌ Ошибка: {e}\nТакже не вышло офлайн: {e2}")
+    finally:
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+
+async def handle_callback(query: types.CallbackQuery, state):
+    data = query.data
+    msg = query.message
+
+    # Достаём исходный текст из предыдущего сообщения (если был)
+    seed = (msg.caption or msg.text or "").strip() or "Кинематографичная сцена"
+
+    if data == "again":
+        w = await msg.answer("🔁 Ещё раз…")
+        try:
+            path = await _gen_replicate(seed, 5)
+            await msg.answer_video(open(path,"rb"),
+                                   caption="✅ Готово. Предпросмотр: 720p, 5 сек.",
+                                   reply_markup=kb_ready())
+        except Exception as e:
+            try:
+                p2 = await offline.generate_video(seed, seconds=5)
+                await msg.answer_video(open(p2,"rb"),
+                                       caption="✅ Готово. Предпросмотр: 720p, 5 сек. (offline)",
+                                       reply_markup=kb_ready())
+            except Exception as e2:
+                await msg.answer(f"❌ Ошибка: {e}\nТакже не вышло офлайн: {e2}")
+        finally:
+            try: await w.delete()
+            except Exception: pass
+        return await query.answer()
+
+    if data == "toggle_res":
+        # Заглушка UI — только сообщение, без реального ресайза (подцепим позже)
+        await msg.answer("📐 Переключил 720p↔1080p (демо).")
+        return await query.answer()
+
+    if data == "make_4k":
+        # Заглушка UI — подключим Luma позже
+        await msg.answer("⚙️ Готовлю 4K… (через Luma после подключения)")
+        return await query.answer()

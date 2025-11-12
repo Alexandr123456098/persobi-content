@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import json
+import shlex
+import argparse
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+# =======================
+# Константы профиля WAN-A
+# =======================
+API_BASE = "https://api.replicate.com/v1"
+T2V_MODEL = "wan-video/wan-2.2-t2v-fast"
+I2V_MODEL = "wan-video/wan-2.2-i2v-fast"
+
+WAN_A_FPS = 16
+WAN_A_FRAMES = 121              # ~7.56 s @ 16 fps
+WAN_A_SECONDS_META = 7.5        # Что пишем в метаданных/логах
+OUT_DIR = Path("/opt/content_factory/out")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# =======================
+# Вспомогательные функции
+# =======================
+class ReplicateError(RuntimeError):
+    pass
+
+def _run(cmd: str, stdin: Optional[bytes] = None, check: bool = True) -> subprocess.CompletedProcess:
+    """Запуск shell-команды c возвратом stdout/stderr."""
+    proc = subprocess.run(
+        cmd,
+        input=stdin,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Command failed [{proc.returncode}]: {cmd}\nSTDERR:\n{proc.stderr.decode(errors='ignore')}")
+    return proc
+
+def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Вызов curl с JSON и разбором ответа."""
+    hdrs = " ".join([f"-H {shlex.quote(f'{k}: {v}')}" for k, v in headers.items()])
+    data = f"-d {shlex.quote(json.dumps(body))}" if body is not None else ""
+    cmd = f"curl -fsS -X {method} {hdrs} {data} {shlex.quote(url)}"
+    proc = _run(cmd, check=True)
+    try:
+        return json.loads(proc.stdout.decode())
+    except Exception as e:
+        raise ReplicateError(f"Bad JSON from {url}: {e}\nRAW:\n{proc.stdout.decode(errors='ignore')}")
+
+def _post_json(url: str, js: Dict[str, Any], token: str) -> Dict[str, Any]:
+    return _curl_json(
+        "POST",
+        url,
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/json",
+        },
+        body=js,
+    )
+
+def _get_json(url: str, token: str) -> Dict[str, Any]:
+    return _curl_json(
+        "GET",
+        url,
+        headers={"Authorization": f"Token {token}"},
+        body=None,
+    )
+
+def _download(url: str, dst: Path):
+    """Скачать файл через curl с повторами."""
+    cmd = f"curl -fL --retry 3 -o {shlex.quote(str(dst))} {shlex.quote(url)}"
+    _run(cmd, check=True)
+
+def _ffmpeg_normalize_to_720p_16fps(src: Path) -> Path:
+    """
+    Нормализация: 16 fps, высота 720 (апскейл разрешён), even dimensions.
+    Выход: mp4 (libx264).
+    """
+    tmp = src.with_suffix(src.suffix + ".norm.tmp.mp4")
+    final = src.with_suffix(".final.mp4")
+
+    vf = "scale=-2:720:flags=lanczos"  # ширина подгоняется автоматом до кратной 2
+    cmd = (
+        f"ffmpeg -y -i {shlex.quote(str(src))} "
+        f"-vf {shlex.quote(vf)} -r {WAN_A_FPS} -c:v libx264 -preset veryfast -movflags +faststart "
+        f"{shlex.quote(str(tmp))}"
+    )
+    _run(cmd, check=True)
+
+    # Перемещаем итог в .final.mp4
+    tmp.rename(final)
+    return final
+
+def _ensure_https_image_url(image_arg: str) -> str:
+    """
+    Возвращает HTTPS-URL для картинки.
+    Если image_arg — http(s) URL → возвращаем как есть.
+    Если это локальный путь → грузим на transfer.sh и возвращаем публичный URL.
+    """
+    if image_arg.lower().startswith("http://") or image_arg.lower().startswith("https://"):
+        return image_arg
+
+    # Локальный путь / file:… -> вытаскиваем файловый путь
+    local = image_arg
+    if image_arg.lower().startswith("file:"):
+        local = image_arg.split(":", 1)[1]
+
+    p = Path(local)
+    if not p.exists():
+        raise FileNotFoundError(f"Image file not found: {p}")
+
+    # Заливаем на transfer.sh
+    # Формат: curl --upload-file <file> https://transfer.sh/<basename>
+    url = f"https://transfer.sh/{p.name}"
+    cmd = f"curl -fsS --upload-file {shlex.quote(str(p))} {shlex.quote(url)}"
+    proc = _run(cmd, check=True)
+    uploaded = proc.stdout.decode().strip()
+    if not uploaded.lower().startswith("https://"):
+        raise RuntimeError(f"transfer.sh returned non-URL: {uploaded}")
+    return uploaded
+
+def _run_prediction(model: str, input_dict: Dict[str, Any], token: str) -> str:
+    """Создать prediction и дождаться результата. Вернуть media URL (строка)."""
+    create = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": input_dict}, token)
+    get_url = (create.get("urls") or {}).get("get", "")
+    if not get_url:
+        raise ReplicateError(f"No urls.get in create response: {create}")
+
+    # Polling
+    while True:
+        resp = _get_json(get_url, token)
+        status = resp.get("status")
+        if status == "succeeded":
+            out = resp.get("output")
+            if isinstance(out, list) and out:
+                return str(out[-1])
+            if isinstance(out, str) and out:
+                return out
+            raise ReplicateError(f"No output url in response: {resp}")
+        if status == "failed":
+            raise ReplicateError(f"Prediction failed: {resp}")
+        # sleep 2
+        _run("sleep 2", check=True)
+
+def _ensure_token() -> str:
+    token = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("REPLICATE_API_TOKEN is not set")
+    return token
+
+# =======================
+# Класс-адаптер
+# =======================
+class ReplicateAdapter:
+    def __init__(self):
+        self.token = _ensure_token()
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _finalize(self, downloaded_path: Path, prefix: str) -> Path:
+        # Нормализуем (720p@16fps) и кладём итоговый с понятным именем
+        normalized = _ffmpeg_normalize_to_720p_16fps(downloaded_path)
+        final_name = OUT_DIR / f"{prefix}_{int(normalized.stat().st_mtime)}.mp4"
+        normalized.rename(final_name)
+        return final_name
+
+    def text(self, prompt: str) -> Dict[str, Any]:
+        # Жёсткий профиль WAN-A: 121 фрейм @16fps
+        input_dict = {
+            "prompt": prompt,
+            "num_frames": WAN_A_FRAMES,
+            "frames_per_second": WAN_A_FPS,
+        }
+        media_url = _run_prediction(T2V_MODEL, input_dict, self.token)
+        tmp = OUT_DIR / f"replicate_wanA_t2v_{int(Path('/proc/uptime').read_text().split('.')[0])}.dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = self._finalize(tmp, "replicate_wanA_t2v")
+        result = {"path": str(final_path), "seconds": WAN_A_SECONDS_META, "fps": WAN_A_FPS, "profile": "wanA_7_5s"}
+        print(json.dumps(result, ensure_ascii=False))
+        return result
+
+    def image(self, image: str, prompt: str) -> Dict[str, Any]:
+        image_url = _ensure_https_image_url(image)
+        input_dict = {
+            "image": image_url,
+            "prompt": prompt,
+            "num_frames": WAN_A_FRAMES,
+            "frames_per_second": WAN_A_FPS,
+        }
+        media_url = _run_prediction(I2V_MODEL, input_dict, self.token)
+        tmp = OUT_DIR / f"replicate_wanA_i2v_{int(Path('/proc/uptime').read_text().split('.')[0])}.dl.tmp.mp4"
+        _download(media_url, tmp)
+        final_path = self._finalize(tmp, "replicate_wanA_i2v")
+        result = {"path": str(final_path), "seconds": WAN_A_SECONDS_META, "fps": WAN_A_FPS, "profile": "wanA_7_5s"}
+        print(json.dumps(result, ensure_ascii=False))
+        return result
+
+# =======================
+# CLI
+# =======================
+def main():
+    parser = argparse.ArgumentParser(prog="replicate_adapter")
+    parser.add_argument("--mode", required=True, choices=["text", "image"], help="text | image")
+    parser.add_argument("--prompt", required=False, default="A cinematic shot, soft light", help="Prompt text")
+    parser.add_argument("--image", required=False, help="Local path or http(s) URL (for mode=image)")
+    args = parser.parse_args()
+
+    ad = ReplicateAdapter()
+
+    if args.mode == "text":
+        if not args.prompt:
+            print("Нужен --prompt для mode=text", file=sys.stderr)
+            sys.exit(2)
+        ad.text(args.prompt)
+        return
+
+    if args.mode == "image":
+        if not args.image:
+            print("Нужно --image для mode=image", file=sys.stderr)
+            sys.exit(2)
+        ad.image(args.image, args.prompt or "")
+        return
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # Печатаем понятную ошибку и выходим с кодом 1
+        print(str(e), file=sys.stderr)
+        sys.exit(1)

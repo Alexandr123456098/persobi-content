@@ -1,0 +1,253 @@
+import os, asyncio, logging, tempfile
+from pathlib import Path
+from aiogram import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import InvalidQueryID
+
+from app.adapters.replicate_adapter import ReplicateClient
+from app.adapters.offline_adapter   import OfflineClient
+from app.adapters.luma_adapter      import LumaClient
+
+log = logging.getLogger("ui")
+
+OUT_DIR = os.environ.get("OUT_DIR", "/opt/content_factory/out")
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# ленивые синглтоны — НЕ создаём клиентов на этапе импорта
+_replicate = None
+_offline  = None
+_luma     = None
+
+# -------------------------------
+# Настройки длительности ролика
+# -------------------------------
+DURATION_PREF = {}  # chat_id -> int (5/10/15)
+
+def _get_duration(chat_id: int) -> int:
+    """Вернуть длительность, по умолчанию 5 сек."""
+    return int(DURATION_PREF.get(chat_id, 5))
+
+def _set_duration(chat_id: int, seconds: int):
+    """Запомнить выбранную длительность (5, 10 или 15 сек)."""
+    if seconds in (5, 10, 15):
+        DURATION_PREF[chat_id] = seconds
+
+
+def _ensure_clients():
+    global _replicate, _offline, _luma
+    if _replicate is None:
+        _replicate = ReplicateClient(OUT_DIR)
+        _offline   = OfflineClient(OUT_DIR)
+        _luma      = LumaClient(OUT_DIR)
+
+def kb_duration():
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("5 сек",  callback_data="dur_5"),
+        InlineKeyboardButton("10 сек", callback_data="dur_10"),
+        InlineKeyboardButton("15 сек", callback_data="dur_15"),
+    )
+    return kb
+
+def kb_ready_extended():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔁 Ещё раз", callback_data="again"),
+        InlineKeyboardButton("🧩 SORA 2", callback_data="sora2"),
+    )
+    kb.add(
+        InlineKeyboardButton("🧷 Точный продукт", callback_data="product_exact"),
+    )
+    kb.add(
+        InlineKeyboardButton("⏱ Выбрать длительность", callback_data="choose_duration"),
+    )
+    return kb
+
+# --- helpers ---
+
+def _get_last_prompt(state, chat_id: int, default: str = "повтори предыдущую сцену"):
+    return state["last_prompt"].get(chat_id, default)
+
+def _set_last_prompt(state, chat_id: int, prompt: str):
+    if prompt:
+        state["last_prompt"][chat_id] = prompt.strip()
+
+def _cinema_prompt(user_text: str) -> str:
+    """
+    Простой локальный шаблон: из русскоязычного описания собираем англоязычную
+    «режиссёрскую» инструкцию. Без внешних API.
+    """
+    raw = (user_text or "").strip()
+    if not raw:
+        return "A short cinematic shot, professional lighting."
+
+    raw_oneline = " ".join(raw.split())
+
+    template = [
+        "Cinematic short video. Romantic, tasteful, natural acting.",
+        f'Source request (ru): "{raw_oneline}"',
+        "Atmosphere: cozy, elegant interior, believable props, no text overlays.",
+        "Lighting: cinematic soft key light, warm practical lights, gentle rim light, natural falloff.",
+        "Camera: gentle dolly-in and very slow pan, steady shot, smooth motion.",
+        "Shot order: 1) wide establishing shot of the scene, 2) medium shot of main subjects, 3) close-up detail for emphasis.",
+        "Optics: shallow depth of field, soft bokeh, professional film composition.",
+        "Grade: warm color grading, subtle film grain, 4K framing, clean background.",
+    ]
+    return "\n".join(template)
+
+
+# --- handlers ---
+
+async def handle_text(message: types.Message, bot_state):
+    _ensure_clients()
+    prompt = (message.text or "").strip()
+    if not prompt:
+        return await message.answer("Напиши описание сцены.")
+    _set_last_prompt(bot_state, message.chat.id, prompt)
+
+    await message.answer("🛠 Генерирую превью…")
+    prompt = _cinema_prompt(prompt)
+    import os  # если уже есть вверху — не дублируй
+    if os.environ.get("ECHO_PROMPT", "0") == "1":
+        await message.answer(f"🎬 Режиссёрский промт:\n\n{prompt[:1800]}")
+    loop = asyncio.get_event_loop()
+    try:
+        dur = _get_duration(message.chat.id)
+        path = await loop.run_in_executor(None, _replicate.generate, prompt, dur)
+        log.info("[ui] replicate(photo) OK: %s", path)
+    except Exception as e:
+        log.warning("[ui] replicate failed: %s, fallback offline", e)
+        path = await loop.run_in_executor(None, _offline.generate, prompt, 5)
+
+    with open(path, "rb") as f:
+        await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready_extended())
+async def _ack_cb(query: types.CallbackQuery):
+    try:
+        await query.answer(cache_time=0)
+    except InvalidQueryID:
+        log.warning("[bot] callback ack missed window (InvalidQueryID); continue")
+
+async def handle_photo(message: types.Message, bot_state):
+    """
+    Фото → сохраняем файл локально, промпт берём из caption.
+    Если у ReplicateClient есть generate_from_image(img_path, prompt, duration) — используем; иначе временно t2v по caption.
+    """
+    _ensure_clients()
+    caption = (message.caption or "").strip()
+    caption = _cinema_prompt(caption)
+    if os.environ.get("ECHO_PROMPT", "0") == "1":
+        await message.answer(f"🎬 Режиссёрский промт:\n\n{prompt[:1800]}")
+    _set_last_prompt(bot_state, message.chat.id, caption or "сделай видео по фото")
+
+    await message.answer("🛠 Генерирую превью по фото…")
+    loop = asyncio.get_event_loop()
+
+    tmp_path = None
+    try:
+        ph = message.photo[-1]  # largest size
+        fd, tmp_path = tempfile.mkstemp(prefix="cf_photo_", suffix=".jpg", dir=OUT_DIR)
+        os.close(fd)
+        await ph.download(destination_file=tmp_path)  # aiogram v2
+
+        if hasattr(_replicate, "generate_from_image"):
+            gen = lambda: _replicate.generate_from_image(tmp_path, caption or "", 5)
+        else:
+            gen = lambda: _replicate.generate(caption or "создай видео по фото", 5)
+
+        path = await loop.run_in_executor(None, gen)
+        log.info("[ui] replicate(photo) OK: %s", path)
+    except Exception as e:
+        log.warning("[ui] photo flow failed: %s — fallback offline", e)
+        path = await loop.run_in_executor(None, _offline.generate, caption or "сцена по фото", 5)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    with open(path, "rb") as f:
+        await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready_extended())
+
+async def handle_callback(query: types.CallbackQuery, bot_state):
+    _ensure_clients()
+    data = (query.data or "").strip()
+    chat_id = query.message.chat.id
+        # --- выбор длительности ---
+    if data in ("choose_duration", "dur_5", "dur_10", "dur_15"):
+        if data == "choose_duration":
+            await query.message.answer("Выбери длительность:", reply_markup=kb_duration())
+        else:
+            sec = int(data.split("_")[1])
+            _set_duration(chat_id, sec)
+            await query.message.answer(f"⏱ Длительность установлена: {sec} сек.")
+        return await _ack_cb(query)
+
+    # --- точный продукт (каталожный ролик из фото) ---
+    if data == "product_exact":
+        # Пытаемся использовать последнее присланное фото — если его нет, просим прислать сейчас
+        img_path = None
+        try:
+            # если у тебя есть свой кэш фото — подключим его
+            from app.bot_handlers_patch import LAST_PHOTO_PATH
+            img_path = LAST_PHOTO_PATH.get(chat_id)
+        except Exception:
+            img_path = None
+
+        if not img_path or not os.path.exists(img_path):
+            await query.message.answer("📸 Пришли фото товара одним сообщением (без сжатия можно). Потом снова нажми «🧷 Точный продукт».")
+            return await _ack_cb(query)
+
+        duration = _get_duration(chat_id)
+
+        # Текст для озвучки — если есть последний промпт, отдадим как подпись для product_exact
+        tts_text = ""
+        try:
+            from app.bot_handlers_patch import LAST_PROMPT
+            tts_text = LAST_PROMPT.get(chat_id, "")
+        except Exception:
+            tts_text = ""
+
+        await query.message.answer("🧷 Собираю точный ролик из твоего фото…")
+        loop = asyncio.get_event_loop()
+
+        def _run_product():
+            import subprocess
+            cmd = ["/opt/content_factory/app/pipelines/product_exact.py", img_path, str(duration)]
+            if tts_text:
+                cmd.append(tts_text)
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if p.returncode != 0:
+                raise RuntimeError(p.stdout)
+            # Скрипт печатает абсолютный путь финального mp4
+            return p.stdout.strip()
+
+        try:
+            path = await loop.run_in_executor(None, _run_product)
+            with open(path, "rb") as f:
+                await query.message.answer_video(f, caption=f"✅ Готово. Точный продукт, {duration} сек.", reply_markup=kb_ready_extended())
+        except Exception as e:
+            await query.message.answer(f"⚠️ Не получилось собрать точный ролик: {e}")
+        return await _ack_cb(query)
+        loop = asyncio.get_event_loop()
+
+    if data in ("again", "sora2"):
+        msg = "🛠 Генерирую ещё раз…" if data == "again" else "🧩 Генерирую SORA 2…"
+        await query.message.answer(msg)
+
+        prompt = _get_last_prompt(bot_state, chat_id)
+        prompt = _cinema_prompt(prompt)
+        try:
+            path = await loop.run_in_executor(None, _replicate.generate, prompt, 5)
+            log.info("[ui] replicate(photo) OK: %s", path)
+        except Exception as e:
+            log.warning("[ui] replicate failed: %s, fallback offline", e)
+            path = await loop.run_in_executor(None, _offline.generate, prompt, 5)
+
+        with open(path, "rb") as f:
+            await query.message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready_extended())
+        await _ack_cb(query)
+
+    
+
+    await _ack_cb(query)
