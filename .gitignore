@@ -37,3 +37,6 @@ token*
 .env.bak*
 
 .gitfilter-replace.txt
+
+# Ignore auto-generated state file
+docs/STATE.json
