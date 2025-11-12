@@ -30,3 +30,8 @@ secrets/
 token*
 *apikey*
 *api_key*
+
+# secrets
+.env
+*.env
+.env.bak*
