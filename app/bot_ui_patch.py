@@ -133,15 +133,18 @@ def _set_pref(state, chat_id: int, key: str, value):
 
 def kb_ready():
     kb = InlineKeyboardMarkup(row_width=2)
+    # 1-я строка: основные действия
     kb.row(
         InlineKeyboardButton("🔁 Ещё раз", callback_data="again"),
         InlineKeyboardButton("🧩 SORA 2", callback_data="sora2_go"),
     )
+    # 2-я строка: загрузки (если включены)
     if ENABLE_UPLOAD:
         kb.row(
             InlineKeyboardButton("📷 По фото", callback_data="photo_help"),
             InlineKeyboardButton("🎬 По видео", callback_data="video_help"),
         )
+    # 3-я строка: настройки — ВСЕГДА последней
     kb.row(InlineKeyboardButton("⚙️ Настройки", callback_data="menu_config"))
     return kb
 
@@ -257,36 +260,31 @@ def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
         return path
 
 
-# ---------- GENERATORS (с ретраями) ----------
+# ---------- GENERATORS ----------
 
 async def _gen_from_text(prompt: str, seconds: int) -> str:
     loop = asyncio.get_event_loop()
-    # до 2 попыток Replicate, затем оффлайн
-    for attempt in range(1, 3):
-        try:
-            path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, seconds)
-            if path and os.path.exists(path) and os.stat(path).st_size > 0:
-                log.info("[ui] replicate(text) OK: %s", path)
-                return path
-            raise RuntimeError("replicate(text) returned empty path")
-        except Exception as e:
-            log.warning("[ui] replicate(text) attempt %d failed: %s", attempt, e)
-    return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+    try:
+        # сигнатура: (prompt, seconds=..., fps=...) — передаём prompt, seconds
+        path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, seconds)
+        log.info("[ui] replicate(text) OK: %s", path)
+        return path
+    except Exception as e:
+        log.warning("[ui] replicate(text) failed: %s; fallback offline", e)
+        return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
 
 async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
     loop = asyncio.get_event_loop()
-    # до 2 попыток Replicate, затем оффлайн
-    for attempt in range(1, 3):
-        try:
-            path = await loop.run_in_executor(None, _replicate.generate_from_image, img_path, prompt, seconds)
-            if path and os.path.exists(path) and os.stat(path).st_size > 0:
-                log.info("[ui] replicate(image) OK: %s", path)
-                return path
-            raise RuntimeError("replicate(image) returned empty path")
-        except Exception as e:
-            log.warning("[ui] replicate(image) attempt %d failed: %s", attempt, e)
-    return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+    try:
+        # сигнатура: (image, prompt="", seconds=..., fps=...)
+        path = await loop.run_in_executor(None, _replicate.generate_from_image, img_path, prompt, seconds)
+        log.info("[ui] replicate(image) OK: %s", path)
+        return path
+    except Exception as e:
+        # ВАЖНО: вместо offline — уходим в текстовую генерацию (чтобы не было «заглушек»)
+        log.warning("[ui] replicate(image) failed: %s; fallback to text", e)
+        return await _gen_from_text(prompt, seconds)
 
 
 # ---------- MESSAGE HANDLERS ----------
@@ -348,8 +346,8 @@ async def handle_photo(message: types.Message, bot_state):
         jpath = _reencode_to_jpeg(tmp_path)
         path = await _gen_from_image(jpath, caption or "", seconds)
     except Exception as e:
-        log.warning("[ui] photo flow failed: %s — fallback offline", e)
-        path = await loop.run_in_executor(None, _offline.generate, caption, seconds)
+        log.warning("[ui] photo flow failed: %s — fallback to text", e)
+        path = await _gen_from_text(caption or "Short daylight scene.", seconds)
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -398,8 +396,8 @@ async def handle_video(message: types.Message, bot_state):
         path = await _gen_from_image(jpath, caption or "", seconds)
 
     except Exception as e:
-        log.warning("[ui] video flow failed: %s — fallback offline", e)
-        path = await loop.run_in_executor(None, _offline.generate, caption, seconds)
+        log.warning("[ui] video flow failed: %s — fallback to text", e)
+        path = await _gen_from_text(caption or "Short daylight scene.", seconds)
     finally:
         if frame_jpg and os.path.exists(frame_jpg):
             try:
@@ -512,8 +510,8 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 path = await _gen_from_text(prompt, seconds)
                 log.info("[ui] again(text) OK: %s", path)
         except Exception as e:
-            log.warning("[ui] again failed: %s — fallback offline", e)
-            path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+            log.warning("[ui] again failed: %s — fallback to text", e)
+            path = await _gen_from_text(prompt, seconds)
 
         path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
@@ -556,8 +554,9 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 path = await _gen_from_text(prompt, seconds)
                 log.info("[ui] sora2(text) OK: %s", path)
         except Exception as e:
-            log.warning("[ui] sora2 failed: %s — fallback offline", e)
-            path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+            # ВАЖНО: общий fallback для SORA 2 — на текст
+            log.warning("[ui] sora2 failed: %s — fallback to text", e)
+            path = await _gen_from_text(prompt, seconds)
 
         path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
@@ -566,9 +565,11 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         return
 
     if data == "photo_help":
-        await query.message.answer("Пришли фото и описание — сделаю ролик.")
+        # Только текст, без клавиатуры
+        await query.message.answer("Пришли фото (или документ с картинкой) и подпись — сделаю ролик.")
         return
 
     if data == "video_help":
-        await query.message.answer("Пришли короткое видео и описание — сделаю ролик.")
+        # Только текст, без клавиатуры
+        await query.message.answer("Пришли короткое видео и подпись — сделаю ролик.")
         return
