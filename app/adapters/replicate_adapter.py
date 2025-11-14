@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, shlex, time, subprocess, uuid
+import os, sys, json, shlex, time, subprocess, uuid, random
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -15,8 +15,8 @@ PRED_DIR.mkdir(parents=True, exist_ok=True)
 
 ENV_PATH = ROOT / ".env"
 DEFAULT_SECONDS = float(os.environ.get("DEFAULT_DURATION", "5"))
-DEFAULT_FPS = int(os.environ.get("REPLICATE_FPS", "16"))
-MAX_FRAMES_HARD = 100  # Wan 2.2: num_frames 81–100
+DEFAULT_FPS = int(os.environ.get("REPLICATE_FPS", "24"))
+MAX_FRAMES_HARD = 100  # Wan 2.2: безопасный верх
 
 WARMUP_SEC = float(os.environ.get("REPLICATE_WARMUP_SEC", "0.5"))
 FIXED_SEED = int(os.environ.get("REPLICATE_FIXED_SEED", "123456789"))
@@ -99,8 +99,8 @@ def _upload_catbox(local_path: Path) -> str:
 
 def _quantize_frames(n: int) -> int:
     """
-    Квантуем количество кадров в допустимый для Wan 2.2 диапазон.
-    Wan 2.2: num_frames ∈ [81, 100].
+    Квантуем количество кадров в безопасный для Wan 2.2 диапазон.
+    Берём градации 81–100.
     """
     safe = [100, 96, 92, 88, 84, 81]
     n = max(1, min(n, MAX_FRAMES_HARD))
@@ -129,10 +129,18 @@ def _is_422(err: Exception) -> bool:
     return " 422" in s or "HTTP 422" in s or "error: 422" in s or "422\n" in s
 
 
+def _make_seed(seed: Optional[int]) -> int:
+    if seed is not None:
+        return int(seed)
+    # рандомный сид, но детерминируемый внутри процесса
+    base = int(time.time() * 1000) ^ random.randint(0, 2_147_483_647)
+    return base % 2_147_483_647 or FIXED_SEED
+
+
 def _predict_with_sla(model: str, base_payload: Dict[str, Any], tok: str) -> str:
     """
-    SLA-логика: теперь перебираем только допустимые варианты Wan 2.2:
-    num_frames ∈ [81, 100], fps ∈ [5, 24].
+    SLA-логика: перебираем только допустимые варианты Wan 2.2:
+    num_frames ~81–100, fps 5–24.
     """
     attempts: List[Dict[str, Any]] = []
 
@@ -213,19 +221,10 @@ def _predict_with_sla(model: str, base_payload: Dict[str, Any], tok: str) -> str
     raise ReplicateError("SLA: exhausted variants")
 
 
-def _ffmpeg_trim(src: Path, fps: int, seconds: float, warm_frames: int) -> Path:
-    ss = warm_frames / max(1, fps)
-    out = src.with_suffix(".trim.mp4")
-    cmd = (
-        f"ffmpeg -y -ss {ss:.2f} -i {shlex.quote(str(src))} "
-        f"-t {float(seconds):.2f} -an -c:v libx264 -preset veryfast -crf 18 "
-        f"-pix_fmt yuv420p -movflags +faststart {shlex.quote(str(out))}"
-    )
-    _run(cmd, check=True)
-    return out
-
-
 def _ffmpeg_norm(src: Path, fps: int) -> Path:
+    """
+    Нормализация без обрезки: берём как есть, гоним в 720p и нужный fps.
+    """
     out = src.with_suffix(".final.mp4")
     vf = "scale=-2:720:flags=lanczos"
     cmd = (
@@ -240,9 +239,8 @@ class ReplicateClient:
     def __init__(self, token: Optional[str] = None):
         self.token = token or _ensure_token()
 
-    def _finalize(self, downloaded_path: Path, prefix: str, fps: int, seconds: float, warm_frames: int) -> Path:
-        trimmed = _ffmpeg_trim(downloaded_path, fps=fps, seconds=seconds, warm_frames=warm_frames)
-        normalized = _ffmpeg_norm(trimmed, fps=fps)
+    def _finalize(self, downloaded_path: Path, prefix: str, fps: int) -> Path:
+        normalized = _ffmpeg_norm(downloaded_path, fps=fps)
         final = OUT_DIR / f"{prefix}_{int(time.time())}.mp4"
         normalized.rename(final)
         return final
@@ -259,20 +257,21 @@ class ReplicateClient:
         fps = int(fps or DEFAULT_FPS)
         fps = max(5, min(fps, 24))
 
-        warm_frames = max(1, round(WARMUP_SEC * fps))
-        total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
+        total_frames = _calc_frames(seconds, fps)
+        use_seed = _make_seed(seed)
 
         payload = {
             "prompt": f"{PROMPT_PRIMER}{prompt}",
-            "num_frames": total_frames,
-            "frames_per_second": fps,
-            "seed": int(seed if seed is not None else FIXED_SEED),
+            "num_frames": int(total_frames),
+            "frames_per_second": int(fps),
+            "seed": int(use_seed),
         }
 
-        url = _predict_with_sla(T2V_MODEL, payload, self.token)
+        tok = self.token
+        url = _predict_with_sla(T2V_MODEL, payload, tok)
         tmp = OUT_DIR / f"replicate_t2v_{int(time.time())}.dl.tmp.mp4"
         _download(url, tmp)
-        final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps, seconds=seconds, warm_frames=warm_frames)
+        final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps)
         return str(final_path)
 
     def generate_from_image(
@@ -285,11 +284,15 @@ class ReplicateClient:
         strength: Optional[float] = None,
         denoise: Optional[float] = None,
     ) -> str:
+        """
+        ВАЖНО: здесь тоже используем T2V_MODEL.
+        Картинка идёт как reference (url в prompt), без отдельной I2V-модели.
+        """
         fps = int(fps or DEFAULT_FPS)
         fps = max(5, min(fps, 24))
 
-        warm_frames = max(1, round(WARMUP_SEC * fps))
-        total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
+        total_frames = _calc_frames(seconds, fps)
+        use_seed = _make_seed(seed)
 
         if image.lower().startswith("http://") or image.lower().startswith("https://"):
             img_url = image
@@ -299,20 +302,21 @@ class ReplicateClient:
                 raise ReplicateError(f"Image not found: {image}")
             img_url = _upload_catbox(p)
 
+        full_prompt = f"{PROMPT_PRIMER}{prompt}".strip()
+        full_prompt = f"{full_prompt} Reference image: {img_url}"
+
         payload = {
-            "image": img_url,
-            "prompt": f"{PROMPT_PRIMER}{prompt}",
-            "num_frames": total_frames,
-            "frames_per_second": fps,
-            "seed": int(seed if seed is not None else FIXED_SEED),
-            "strength": float(strength if strength is not None else os.getenv("REPLICATE_I2V_STRENGTH", "0.55")),
-            "denoise": float(denoise if denoise is not None else os.getenv("REPLICATE_I2V_DENOISE", "0.35")),
+            "prompt": full_prompt,
+            "num_frames": int(total_frames),
+            "frames_per_second": int(fps),
+            "seed": int(use_seed),
         }
 
-        url = _predict_with_sla(I2V_MODEL, payload, self.token)
-        tmp = OUT_DIR / f"replicate_i2v_{int(time.time())}.dl.tmp.mp4"
+        tok = self.token
+        url = _predict_with_sla(T2V_MODEL, payload, tok)
+        tmp = OUT_DIR / f"replicate_t2v_{int(time.time())}.dl.tmp.mp4"
         _download(url, tmp)
-        final_path = self._finalize(tmp, "replicate_wanA_i2v", fps=fps, seconds=seconds, warm_frames=warm_frames)
+        final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps)
         return str(final_path)
 
     # back-compat

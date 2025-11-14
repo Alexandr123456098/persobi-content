@@ -34,7 +34,6 @@ _offline: Optional[OfflineClient] = None
 def _ensure_clients():
     global _replicate, _offline
     if _replicate is None:
-        # как в золотом Persobi: передаём OUT_DIR
         _replicate = ReplicateClient()
     if _offline is None:
         _offline = OfflineClient(OUT_DIR)
@@ -103,7 +102,7 @@ def _get_last_preview(state, chat_id: int) -> Optional[str]:
     return _get_box(state, "last_preview").get(chat_id)
 
 
-def _set_last_preview(state, chat_id: int, path: Optional[str]):
+def _set_last_preview(state, chat_id: int, path: str):
     if path and os.path.exists(path):
         _get_box(state, "last_preview")[chat_id] = path
 
@@ -113,7 +112,6 @@ def _get_prefs(state, chat_id: int) -> dict:
     if not isinstance(prefs, dict):
         prefs = {"dur": DEFAULT_DUR, "sound": "off"}
         _get_box(state, "prefs")[chat_id] = prefs
-    # нормализация длительности
     prefs["dur"] = int(prefs.get("dur", DEFAULT_DUR))
     if prefs["dur"] not in (5, 7, 10):
         prefs["dur"] = 5
@@ -140,12 +138,8 @@ def _sora2_price(seconds: int, sound_flag: int) -> int:
       5 сек, со звуком  — 100 ₽
       7.5 сек, без звука — 125 ₽
       7.5 сек, со звуком — 150 ₽
-
-    seconds квантуем в две корзины:
-      <= 5   -> 5
-      >  5   -> 7.5 (берём как «длинный» вариант)
     """
-    sec_norm = 5 if seconds <= 5 else 8  # 8 здесь просто метка «7.5/длинное»
+    sec_norm = 5 if seconds <= 5 else 8
     snd = 1 if sound_flag else 0
 
     if sec_norm == 5:
@@ -256,13 +250,13 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
-    # пока без доп. аудио/постобработки — главное, чтобы не ломалось
     return path
 
 
 # ---------- GENERATORS ----------
 
 async def _gen_from_text(prompt: str, seconds: int) -> str:
+    _ensure_clients()
     loop = asyncio.get_event_loop()
     try:
         path = await loop.run_in_executor(None, _replicate.generate_from_text, prompt, seconds)
@@ -274,6 +268,7 @@ async def _gen_from_text(prompt: str, seconds: int) -> str:
 
 
 async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
+    _ensure_clients()
     loop = asyncio.get_event_loop()
     try:
         path = await loop.run_in_executor(None, _replicate.generate_from_image, img_path, prompt, seconds)
@@ -287,7 +282,6 @@ async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
 # ---------- MESSAGE HANDLERS ----------
 
 async def handle_text(message: types.Message, bot_state):
-    _ensure_clients()
     _ensure_state(bot_state)
 
     prompt = (message.text or "").strip()
@@ -311,7 +305,6 @@ async def handle_text(message: types.Message, bot_state):
 
 
 async def handle_photo(message: types.Message, bot_state):
-    _ensure_clients()
     _ensure_state(bot_state)
 
     caption = _cinema_prompt(message.caption or "")
@@ -360,7 +353,6 @@ async def handle_photo(message: types.Message, bot_state):
 
 
 async def handle_video(message: types.Message, bot_state):
-    _ensure_clients()
     _ensure_state(bot_state)
 
     caption = _cinema_prompt(message.caption or "")
@@ -416,7 +408,6 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
     chat_id = query.message.chat.id
     ensure_user(chat_id)
 
-    # --- меню настроек ---
     if data == "menu_config":
         kb = kb_menu_config(bot_state, chat_id)
         return await query.message.answer("⚙️ Настройки:", reply_markup=kb)
@@ -437,7 +428,6 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         _set_pref(bot_state, chat_id, "sound", "off")
         return await query.message.answer("🔇 Без звука.")
 
-    # --- рассчёт цены базового превью ---
     if data == "calc_price":
         p = _get_prefs(bot_state, chat_id)
         dur = int(p["dur"])
@@ -484,7 +474,6 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         )
         return await handle_callback(fake, bot_state)
 
-    # --- обычный «Ещё раз» ---
     if data == "again":
         p = _get_prefs(bot_state, chat_id)
         seconds = int(p["dur"])
@@ -511,7 +500,6 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 reply_markup=kb_ready()
             )
 
-    # --- SORA2: премиум «Ещё раз» ---
     if data == "sora2_go":
         await query.message.answer("🧩 Генерирую SORA 2…")
 
@@ -565,9 +553,8 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 reply_markup=kb_ready()
             )
 
-    # --- help-кнопки ---
     if data == "photo_help":
-        return await query.message.answer("Пришли фото + подпись.", reply_markup=kb_ready())
+        return await query.message.answer("Пришли фото + подпись.")
 
     if data == "video_help":
-        return await query.message.answer("Пришли короткое видео + подпись.", reply_markup=kb_ready())
+        return await query.message.answer("Пришли короткое видео + подпись.")
