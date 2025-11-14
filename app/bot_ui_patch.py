@@ -15,7 +15,7 @@ from aiogram.utils.exceptions import InvalidQueryID
 from app.adapters.replicate_adapter import ReplicateClient
 from app.adapters.offline_adapter import OfflineClient
 from app.billing import ensure_user, get_balance, charge
-from app.pricing import price, price_sora2
+from app.pricing import price
 
 log = logging.getLogger("ui")
 
@@ -30,12 +30,15 @@ _enable_upload = True
 _replicate: Optional[ReplicateClient] = None
 _offline: Optional[OfflineClient] = None
 
+
 def _ensure_clients():
     global _replicate, _offline
     if _replicate is None:
-        _replicate = ReplicateClient()
+        # как в золотом Persobi: передаём OUT_DIR
+        _replicate = ReplicateClient(OUT_DIR)
     if _offline is None:
         _offline = OfflineClient(OUT_DIR)
+
 
 # ---------- state helpers ----------
 
@@ -44,6 +47,7 @@ def _is_mapping(obj) -> bool:
         return hasattr(obj, "items") and callable(getattr(obj, "items"))
     except Exception:
         return False
+
 
 def _get_box(state, name: str) -> dict:
     if _is_mapping(state):
@@ -59,6 +63,7 @@ def _get_box(state, name: str) -> dict:
             return {}
     return getattr(state, name)
 
+
 def _ensure_state(bot_state):
     _get_box(bot_state, "last_prompt")
     _get_box(bot_state, "last_image")
@@ -66,39 +71,49 @@ def _ensure_state(bot_state):
     _get_box(bot_state, "last_preview")
     _get_box(bot_state, "prefs")
 
+
 def _get_last_prompt(state, chat_id: int, default: str = "") -> str:
     return _get_box(state, "last_prompt").get(chat_id, default)
+
 
 def _set_last_prompt(state, chat_id: int, prompt: str):
     if prompt:
         _get_box(state, "last_prompt")[chat_id] = prompt.strip()
 
+
 def _get_last_image(state, chat_id: int) -> Optional[str]:
     return _get_box(state, "last_image").get(chat_id)
+
 
 def _set_last_image(state, chat_id: int, path: Optional[str]):
     if path and os.path.exists(path):
         _get_box(state, "last_image")[chat_id] = path
 
+
 def _get_last_video(state, chat_id: int) -> Optional[str]:
     return _get_box(state, "last_video").get(chat_id)
+
 
 def _set_last_video(state, chat_id: int, path: Optional[str]):
     if path and os.path.exists(path):
         _get_box(state, "last_video")[chat_id] = path
 
+
 def _get_last_preview(state, chat_id: int) -> Optional[str]:
     return _get_box(state, "last_preview").get(chat_id)
+
 
 def _set_last_preview(state, chat_id: int, path: Optional[str]):
     if path and os.path.exists(path):
         _get_box(state, "last_preview")[chat_id] = path
+
 
 def _get_prefs(state, chat_id: int) -> dict:
     prefs = _get_box(state, "prefs").get(chat_id)
     if not isinstance(prefs, dict):
         prefs = {"dur": DEFAULT_DUR, "sound": "off"}
         _get_box(state, "prefs")[chat_id] = prefs
+    # нормализация длительности
     prefs["dur"] = int(prefs.get("dur", DEFAULT_DUR))
     if prefs["dur"] not in (5, 7, 10):
         prefs["dur"] = 5
@@ -107,10 +122,41 @@ def _get_prefs(state, chat_id: int) -> dict:
     _get_box(state, "prefs")[chat_id] = prefs
     return prefs
 
+
 def _set_pref(state, chat_id: int, key: str, value):
     prefs = _get_prefs(state, chat_id)
     prefs[key] = value
     _get_box(state, "prefs")[chat_id] = prefs
+
+
+# ---------- pricing helpers ----------
+
+def _sora2_price(seconds: int, sound_flag: int) -> int:
+    """
+    SORA2 = премиум «Ещё раз».
+
+    Тарифы:
+      5 сек, без звука  — 75 ₽
+      5 сек, со звуком  — 100 ₽
+      7.5 сек, без звука — 125 ₽
+      7.5 сек, со звуком — 150 ₽
+
+    seconds мы квантуем в два корзины:
+      <= 5   -> 5
+      >  5   -> 7.5 (берём как «длинный» вариант)
+    """
+    sec_norm = 5 if seconds <= 5 else 8  # 8 здесь просто метка «7.5/длинное»
+    snd = 1 if sound_flag else 0
+
+    if sec_norm == 5:
+        if snd == 0:
+            return 75
+        return 100
+    else:
+        if snd == 0:
+            return 125
+        return 150
+
 
 # ---------- keyboards ----------
 
@@ -128,22 +174,26 @@ def kb_ready():
     kb.row(InlineKeyboardButton("⚙️ Настройки", callback_data="menu_config"))
     return kb
 
+
 def kb_menu_config(state, chat_id: int):
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(InlineKeyboardButton("⏱ 7.5 сек", callback_data="dur_set75"))
-    kb.row(InlineKeyboardButton("⏱ 5 сек", callback_data="dur_set5"))
-    kb.row(
-        InlineKeyboardButton("🎙 Со звуком", callback_data="sound_on"),
-        InlineKeyboardButton("🔇 Без звука", callback_data="sound_off"),
-    )
-    kb.row(InlineKeyboardButton("💵 Посчитать цену", callback_data="calc_price"))
+    if FEATURE_DURATION_SOUND_MENU:
+        kb.row(InlineKeyboardButton("⏱ 7.5 сек", callback_data="dur_set75"))
+        kb.row(InlineKeyboardButton("⏱ 5 сек", callback_data="dur_set5"))
+        kb.row(
+            InlineKeyboardButton("🎙 Со звуком", callback_data="sound_on"),
+            InlineKeyboardButton("🔇 Без звука", callback_data="sound_off"),
+        )
+        kb.row(InlineKeyboardButton("💵 Посчитать цену", callback_data="calc_price"))
     return kb
+
 
 # ---------- helpers ----------
 
 def _cinema_prompt(user_text: str) -> str:
     raw = (user_text or "").strip()
     return raw if raw else "Short daylight scene."
+
 
 def _run(cmd: list[str]) -> bool:
     try:
@@ -152,17 +202,20 @@ def _run(cmd: list[str]) -> bool:
     except Exception:
         return False
 
+
 def _try_ffmpeg_frame(src_video: str, dst_jpg: str) -> bool:
     return (
         _run(["ffmpeg", "-y", "-ss", "1", "-i", src_video, "-frames:v", "1", "-q:v", "3", dst_jpg])
         or _run(["ffmpeg", "-y", "-i", src_video, "-frames:v", "1", "-q:v", "3", dst_jpg])
     ) and os.path.exists(dst_jpg) and os.stat(dst_jpg).st_size > 0
 
+
 def _try_ffmpeg(src: str, dst: str) -> bool:
     return (
         _run(["ffmpeg", "-y", "-i", src, "-vf", "format=rgb24", "-q:v", "3", dst])
         and os.path.exists(dst) and os.stat(dst).st_size > 0
     )
+
 
 def _try_imagemagick(src: str, dst: str) -> bool:
     for cmd in (["magick", src, "-auto-orient", "-quality", "92", dst],
@@ -171,6 +224,7 @@ def _try_imagemagick(src: str, dst: str) -> bool:
             return True
     return False
 
+
 def _try_pillow(src: str, dst: str) -> bool:
     try:
         from PIL import Image
@@ -178,6 +232,7 @@ def _try_pillow(src: str, dst: str) -> bool:
         return os.path.exists(dst) and os.stat(dst).st_size > 0
     except Exception:
         return False
+
 
 def _reencode_to_jpeg(src_path: str) -> str:
     dst = str(Path(src_path).with_suffix(".jpg"))
@@ -188,17 +243,22 @@ def _reencode_to_jpeg(src_path: str) -> str:
         pass
     return dst if ok else src_path
 
+
 async def _ack_cb(query: types.CallbackQuery):
     try:
         await query.answer(cache_time=0)
     except InvalidQueryID:
         pass
 
+
 def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
     _set_last_preview(bot_state, chat_id, path)
 
+
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
+    # пока без доп. аудио/постобработки — главное, чтобы не ломалось
     return path
+
 
 # ---------- GENERATORS ----------
 
@@ -212,6 +272,7 @@ async def _gen_from_text(prompt: str, seconds: int) -> str:
         log.warning("[ui] replicate(text) failed: %s", e)
         return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
+
 async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
     loop = asyncio.get_event_loop()
     try:
@@ -221,6 +282,7 @@ async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
     except Exception as e:
         log.warning("[ui] replicate(image) failed: %s", e)
         return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+
 
 # ---------- MESSAGE HANDLERS ----------
 
@@ -241,10 +303,12 @@ async def handle_text(message: types.Message, bot_state):
 
     await message.answer("🎬 Готовлю…")
     path = await _gen_from_text(prompt, seconds)
+    path = _apply_postprocess(path, seconds, p["sound"])
 
     _store_preview_and_reply_path(bot_state, chat_id, path)
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
+
 
 async def handle_photo(message: types.Message, bot_state):
     _ensure_clients()
@@ -283,15 +347,17 @@ async def handle_photo(message: types.Message, bot_state):
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except:
+            except Exception:
                 pass
 
     if jpath:
         _set_last_image(bot_state, chat_id, jpath)
 
+    path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
+
 
 async def handle_video(message: types.Message, bot_state):
     _ensure_clients()
@@ -330,12 +396,14 @@ async def handle_video(message: types.Message, bot_state):
         if frame_jpg and os.path.exists(frame_jpg):
             try:
                 os.remove(frame_jpg)
-            except:
+            except Exception:
                 pass
 
+    path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
+
 
 # ---------- CALLBACKS ----------
 
@@ -348,6 +416,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
     chat_id = query.message.chat.id
     ensure_user(chat_id)
 
+    # --- меню настроек ---
     if data == "menu_config":
         kb = kb_menu_config(bot_state, chat_id)
         return await query.message.answer("⚙️ Настройки:", reply_markup=kb)
@@ -368,6 +437,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         _set_pref(bot_state, chat_id, "sound", "off")
         return await query.message.answer("🔇 Без звука.")
 
+    # --- рассчёт цены базового превью ---
     if data == "calc_price":
         p = _get_prefs(bot_state, chat_id)
         dur = int(p["dur"])
@@ -380,12 +450,20 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
             kb.add(InlineKeyboardButton("✅ Согласен, генерировать", callback_data="confirm_pay"))
         else:
             kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
-        return await query.message.answer(f"{sel}\nСтоимость: {cost} ₽\nБаланс: {bal} ₽", reply_markup=kb)
+        return await query.message.answer(
+            f"{sel}\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+            reply_markup=kb
+        )
 
     if data == "add_money":
         from app.billing import add_balance
         add_balance(chat_id, 200, "Пополнение")
-        fake = types.CallbackQuery(id=query.id, from_user=query.from_user, message=query.message, data="calc_price")
+        fake = types.CallbackQuery(
+            id=query.id,
+            from_user=query.from_user,
+            message=query.message,
+            data="calc_price"
+        )
         return await handle_callback(fake, bot_state)
 
     if data == "confirm_pay":
@@ -398,9 +476,15 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
             return await query.message.answer("❌ Недостаточно средств.")
         charge(chat_id, 0, cost)
         await query.message.answer(f"✅ Оплачено {cost} ₽. Генерирую…")
-        fake = types.CallbackQuery(id=query.id, from_user=query.from_user, message=query.message, data="again")
+        fake = types.CallbackQuery(
+            id=query.id,
+            from_user=query.from_user,
+            message=query.message,
+            data="again"
+        )
         return await handle_callback(fake, bot_state)
 
+    # --- обычный «Ещё раз» ---
     if data == "again":
         p = _get_prefs(bot_state, chat_id)
         seconds = int(p["dur"])
@@ -418,27 +502,36 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         except Exception:
             path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
+        path = _apply_postprocess(path, seconds, p["sound"])
         _store_preview_and_reply_path(bot_state, chat_id, path)
         with open(path, "rb") as f:
-            return await query.message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
+            return await query.message.answer_video(
+                f,
+                caption="✅ Готово. Предпросмотр:",
+                reply_markup=kb_ready()
+            )
 
+    # --- SORA2: премиум «Ещё раз» ---
     if data == "sora2_go":
         await query.message.answer("🧩 Генерирую SORA 2…")
 
         p = _get_prefs(bot_state, chat_id)
         seconds = int(p["dur"])
         sound = p["sound"]
+        snd_flag = 1 if sound == "on" else 0
         prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
 
         last_video = _get_last_video(bot_state, chat_id)
         last_img = _get_last_image(bot_state, chat_id)
         last_prev = _get_last_preview(bot_state, chat_id)
 
-        cost = price_sora2(seconds, 1 if sound == "on" else 0)
+        cost = _sora2_price(seconds, snd_flag)
         bal = get_balance(chat_id)
         if bal < cost:
             return await query.message.answer("❌ Недостаточно средств для SORA2.")
+
         charge(chat_id, 0, cost)
+        await query.message.answer(f"✅ SORA2: списано {cost} ₽. Генерирую…")
 
         loop = asyncio.get_event_loop()
         try:
@@ -463,10 +556,16 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
             log.warning("[ui] sora2 error: %s", e)
             path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
+        path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
         with open(path, "rb") as f:
-            return await query.message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
+            return await query.message.answer_video(
+                f,
+                caption="✅ Готово. Предпросмотр:",
+                reply_markup=kb_ready()
+            )
 
+    # --- help-кнопки ---
     if data == "photo_help":
         return await query.message.answer("Пришли фото + подпись.", reply_markup=kb_ready())
 
