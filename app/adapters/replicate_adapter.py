@@ -22,8 +22,12 @@ WARMUP_SEC = float(os.environ.get("REPLICATE_WARMUP_SEC", "0.5"))
 FIXED_SEED = int(os.environ.get("REPLICATE_FIXED_SEED", "123456789"))
 
 PROMPT_PRIMER = (
-    "Start immediately with a sharp, fully resolved photorealistic frame. "
-    "No painterly intro or plastic placeholder. Cinematic, stable exposure, no glitches. "
+    "Start immediately with a sharp, fully resolved photorealistic frame from the very first frame. "
+    "No fade-in, no drawing animation, no painterly brushstrokes, no plastic placeholder. "
+    "Cinematic, stable exposure, no glitches. "
+    "Do NOT show fairy lights, garlands, Christmas lights, glowing decorations or bokeh garlands in the background. "
+    "When a reference image is provided, keep the same main person, face, body and camera angle, "
+    "and change only what is explicitly requested in the prompt. "
 )
 
 
@@ -132,7 +136,6 @@ def _is_422(err: Exception) -> bool:
 def _make_seed(seed: Optional[int]) -> int:
     if seed is not None:
         return int(seed)
-    # рандомный сид, но детерминируемый внутри процесса
     base = int(time.time() * 1000) ^ random.randint(0, 2_147_483_647)
     return base % 2_147_483_647 or FIXED_SEED
 

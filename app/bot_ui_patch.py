@@ -14,7 +14,7 @@ from aiogram.utils.exceptions import InvalidQueryID
 
 from app.adapters.replicate_adapter import ReplicateClient
 from app.adapters.offline_adapter import OfflineClient
-from app.billing import ensure_user, get_balance, charge
+from app.billing import ensure_user, get_balance, charge, register_preview_and_charge
 from app.pricing import price
 
 log = logging.getLogger("ui")
@@ -250,7 +250,29 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
-    return path
+    """
+    Режем первые ~0.6 секунды, чтобы не было «рисования кисточкой».
+    При любой ошибке возвращаем исходный путь.
+    """
+    try:
+        src = Path(path)
+        if not src.exists():
+            return path
+        cut_start = 0.6
+        dst = src.with_suffix(".trim.mp4")
+        ok = _run([
+            "ffmpeg",
+            "-y",
+            "-ss", str(cut_start),
+            "-i", str(src),
+            "-c", "copy",
+            str(dst),
+        ])
+        if ok and dst.exists() and dst.stat().st_size > 0:
+            return str(dst)
+        return path
+    except Exception:
+        return path
 
 
 # ---------- GENERATORS ----------
@@ -289,13 +311,29 @@ async def handle_text(message: types.Message, bot_state):
         return await message.answer("Напиши описание сцены.")
 
     chat_id = message.chat.id
+    ensure_user(chat_id)
     _set_last_prompt(bot_state, chat_id, prompt)
     _get_box(bot_state, "last_image").pop(chat_id, None)
 
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
+    snd_flag = 1 if p["sound"] == "on" else 0
 
-    await message.answer("🎬 Генерирую превью…")
+    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    if not ok:
+        bal = get_balance(chat_id)
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+        return await message.answer(
+            f"❌ Недостаточно средств.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+            reply_markup=kb,
+        )
+
+    if cost > 0:
+        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    else:
+        await message.answer("🎬 Генерирую превью…")
+
     path = await _gen_from_text(prompt, seconds)
     path = _apply_postprocess(path, seconds, p["sound"])
 
@@ -309,12 +347,30 @@ async def handle_photo(message: types.Message, bot_state):
 
     caption = _cinema_prompt(message.caption or "")
     chat_id = message.chat.id
+    ensure_user(chat_id)
     _set_last_prompt(bot_state, chat_id, caption)
 
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
+    snd_flag = 1 if p["sound"] == "on" else 0
 
-    await message.answer("🎬 Генерирую превью…")
+    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    if not ok:
+        bal = get_balance(chat_id)
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+        return await message.answer(
+            f"❌ Недостаточно средств.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+            reply_markup=kb,
+        )
+
+    if cost > 0:
+        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    else:
+        await message.answer("🎬 Генерирую превью…")
+
+    p = _get_prefs(bot_state, chat_id)
+    seconds = int(p["dur"])
 
     loop = asyncio.get_event_loop()
     tmp_path = None
@@ -357,12 +413,27 @@ async def handle_video(message: types.Message, bot_state):
 
     caption = _cinema_prompt(message.caption or "")
     chat_id = message.chat.id
+    ensure_user(chat_id)
     _set_last_prompt(bot_state, chat_id, caption)
 
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
+    snd_flag = 1 if p["sound"] == "on" else 0
 
-    await message.answer("🎬 Генерирую превью…")
+    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    if not ok:
+        bal = get_balance(chat_id)
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+        return await message.answer(
+            f"❌ Недостаточно средств.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+            reply_markup=kb,
+        )
+
+    if cost > 0:
+        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    else:
+        await message.answer("🎬 Генерирую превью…")
 
     loop = asyncio.get_event_loop()
     tmp_video = None
@@ -463,8 +534,17 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         cost = price(dur, snd)
         bal = get_balance(chat_id)
         if bal < cost:
-            return await query.message.answer("❌ Недостаточно средств.")
-        charge(chat_id, 0, cost)
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer(
+                f"❌ Недостаточно средств.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+                reply_markup=kb,
+            )
+        if not charge(chat_id, 0, cost):
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer("❌ Недостаточно средств.", reply_markup=kb)
+
         await query.message.answer(f"✅ Оплачено {cost} ₽. Генерирую…")
         fake = types.CallbackQuery(
             id=query.id,
@@ -477,10 +557,26 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
     if data == "again":
         p = _get_prefs(bot_state, chat_id)
         seconds = int(p["dur"])
+        snd_flag = 1 if p["sound"] == "on" else 0
+
+        ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+        if not ok:
+            bal = get_balance(chat_id)
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer(
+                f"❌ Недостаточно средств.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+                reply_markup=kb,
+            )
+
+        if cost > 0:
+            await query.message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+        else:
+            await query.message.answer("🎬 Генерирую превью…")
+
         prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
         last_img = _get_last_image(bot_state, chat_id)
 
-        await query.message.answer("🎬 Генерирую превью…")
         loop = asyncio.get_event_loop()
         try:
             if last_img and os.path.exists(last_img):
@@ -516,9 +612,18 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         cost = _sora2_price(seconds, snd_flag)
         bal = get_balance(chat_id)
         if bal < cost:
-            return await query.message.answer("❌ Недостаточно средств для SORA2.")
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer(
+                f"❌ Недостаточно средств для SORA2.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+                reply_markup=kb,
+            )
 
-        charge(chat_id, 0, cost)
+        if not charge(chat_id, 0, cost):
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer("❌ Недостаточно средств для SORA2.", reply_markup=kb)
+
         await query.message.answer(f"✅ SORA2: списано {cost} ₽. Генерирую…")
 
         loop = asyncio.get_event_loop()
