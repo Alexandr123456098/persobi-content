@@ -35,7 +35,7 @@ def _ensure_clients():
     global _replicate, _offline
     if _replicate is None:
         # как в золотом Persobi: передаём OUT_DIR
-        _replicate = ReplicateClient(OUT_DIR)
+        _replicate = ReplicateClient()
     if _offline is None:
         _offline = OfflineClient(OUT_DIR)
 
@@ -141,7 +141,7 @@ def _sora2_price(seconds: int, sound_flag: int) -> int:
       7.5 сек, без звука — 125 ₽
       7.5 сек, со звуком — 150 ₽
 
-    seconds мы квантуем в два корзины:
+    seconds квантуем в две корзины:
       <= 5   -> 5
       >  5   -> 7.5 (берём как «длинный» вариант)
     """
@@ -301,7 +301,7 @@ async def handle_text(message: types.Message, bot_state):
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
 
-    await message.answer("🎬 Готовлю…")
+    await message.answer("🎬 Генерирую превью…")
     path = await _gen_from_text(prompt, seconds)
     path = _apply_postprocess(path, seconds, p["sound"])
 
@@ -321,7 +321,7 @@ async def handle_photo(message: types.Message, bot_state):
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
 
-    await message.answer("🎬 Готовлю…")
+    await message.answer("🎬 Генерирую превью…")
 
     loop = asyncio.get_event_loop()
     tmp_path = None
@@ -370,7 +370,7 @@ async def handle_video(message: types.Message, bot_state):
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
 
-    await message.answer("🎬 Готовлю…")
+    await message.answer("🎬 Генерирую превью…")
 
     loop = asyncio.get_event_loop()
     tmp_video = None
@@ -491,7 +491,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
         last_img = _get_last_image(bot_state, chat_id)
 
-        await query.message.answer("🎬 Готовлю…")
+        await query.message.answer("🎬 Генерирую превью…")
         loop = asyncio.get_event_loop()
         try:
             if last_img and os.path.exists(last_img):

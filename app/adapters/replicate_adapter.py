@@ -16,7 +16,8 @@ PRED_DIR.mkdir(parents=True, exist_ok=True)
 ENV_PATH = ROOT / ".env"
 DEFAULT_SECONDS = float(os.environ.get("DEFAULT_DURATION", "5"))
 DEFAULT_FPS = int(os.environ.get("REPLICATE_FPS", "16"))
-MAX_FRAMES_HARD = 121
+MAX_FRAMES_HARD = 100  # Wan 2.2: num_frames 81–100
+
 WARMUP_SEC = float(os.environ.get("REPLICATE_WARMUP_SEC", "0.5"))
 FIXED_SEED = int(os.environ.get("REPLICATE_FIXED_SEED", "123456789"))
 
@@ -25,14 +26,17 @@ PROMPT_PRIMER = (
     "No painterly intro or plastic placeholder. Cinematic, stable exposure, no glitches. "
 )
 
+
 class ReplicateError(RuntimeError):
     pass
 
-def _run(cmd: str, stdin: Optional[bytes]=None, check=True) -> subprocess.CompletedProcess:
+
+def _run(cmd: str, stdin: Optional[bytes] = None, check=True) -> subprocess.CompletedProcess:
     p = subprocess.run(cmd, input=stdin, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and p.returncode != 0:
         raise RuntimeError(f"Command failed [{p.returncode}]: {cmd}\nSTDERR:\n{p.stderr.decode(errors='ignore')}")
     return p
+
 
 def _parse_dotenv_token(path: Path) -> str:
     if not path.exists():
@@ -45,9 +49,11 @@ def _parse_dotenv_token(path: Path) -> str:
         return ""
     return ""
 
+
 def _looks_like_path(s: str) -> bool:
     s = s.strip()
     return s.startswith("/") or s.startswith("./") or s.startswith("../")
+
 
 def _ensure_token() -> str:
     tok = os.environ.get("REPLICATE_API_TOKEN", "").strip()
@@ -57,8 +63,9 @@ def _ensure_token() -> str:
         raise ReplicateError("REPLICATE_API_TOKEN invalid or missing")
     return tok
 
-def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
-    hdr = " ".join([f"-H {shlex.quote(f'{k}: {v}')}" for k,v in headers.items()])
+
+def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    hdr = " ".join([f"-H {shlex.quote(f'{k}: {v}')}" for k, v in headers.items()])
     data = f"-d {shlex.quote(json.dumps(body))}" if body else ""
     cmd = f"curl -fsS -X {method} {hdr} {data} {shlex.quote(url)}"
     p = _run(cmd, check=True)
@@ -67,55 +74,83 @@ def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[Di
     except Exception as e:
         raise ReplicateError(f"Bad JSON from {url}: {e}\nRAW:\n{p.stdout.decode(errors='ignore')}")
 
-def _post_json(url: str, js: Dict[str,Any], tok: str) -> Dict[str,Any]:
-    return _curl_json("POST", url, {"Authorization": f"Token {tok}", "Content-Type":"application/json"}, js)
 
-def _get_json(url: str, tok: str) -> Dict[str,Any]:
+def _post_json(url: str, js: Dict[str, Any], tok: str) -> Dict[str, Any]:
+    return _curl_json("POST", url, {"Authorization": f"Token {tok}", "Content-Type": "application/json"}, js)
+
+
+def _get_json(url: str, tok: str) -> Dict[str, Any]:
     return _curl_json("GET", url, {"Authorization": f"Token {tok}"})
+
 
 def _download(url: str, dst: Path):
     _run(f"curl -fsSL --retry 3 -o {shlex.quote(str(dst))} {shlex.quote(url)}", check=True)
 
+
 def _upload_catbox(local_path: Path) -> str:
-    out = _run(f"curl -fsS -F 'reqtype=fileupload' -F 'fileToUpload=@{shlex.quote(str(local_path))}' https://catbox.moe/user/api.php", check=True).stdout.decode().strip()
+    out = _run(
+        f"curl -fsS -F 'reqtype=fileupload' -F 'fileToUpload=@{shlex.quote(str(local_path))}' https://catbox.moe/user/api.php",
+        check=True,
+    ).stdout.decode().strip()
     if not out.startswith("http"):
         raise ReplicateError(f"catbox upload failed: {out}")
     return out
 
+
 def _quantize_frames(n: int) -> int:
-    safe = [121,112,104,96,88,81,72,64,60,56,48,40,36,32,28,24,20,16,12,8]
+    """
+    Квантуем количество кадров в допустимый для Wan 2.2 диапазон.
+    Wan 2.2: num_frames ∈ [81, 100].
+    """
+    safe = [100, 96, 92, 88, 84, 81]
     n = max(1, min(n, MAX_FRAMES_HARD))
     for s in safe:
         if s <= n:
             return s
-    return 8
+    return 81
+
 
 def _calc_frames(sec: float, fps: int) -> int:
-    return _quantize_frames(int(round(float(sec) * fps)))
+    n = int(round(float(sec) * fps))
+    n = max(1, min(n, MAX_FRAMES_HARD))
+    return _quantize_frames(n)
 
-def _log_json(js: Dict[str,Any]):
+
+def _log_json(js: Dict[str, Any]):
     try:
         fname = PRED_DIR / f"{uuid.uuid4().hex[:10]}.json"
         fname.write_text(json.dumps(js, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
+
 def _is_422(err: Exception) -> bool:
     s = str(err)
     return " 422" in s or "HTTP 422" in s or "error: 422" in s or "422\n" in s
 
-def _predict_with_sla(model: str, base_payload: Dict[str,Any], tok: str) -> str:
-    attempts: List[Dict[str,Any]] = []
+
+def _predict_with_sla(model: str, base_payload: Dict[str, Any], tok: str) -> str:
+    """
+    SLA-логика: теперь перебираем только допустимые варианты Wan 2.2:
+    num_frames ∈ [81, 100], fps ∈ [5, 24].
+    """
+    attempts: List[Dict[str, Any]] = []
+
     start_fps = int(base_payload.get("frames_per_second", DEFAULT_FPS))
-    start_nf  = int(base_payload.get("num_frames", _calc_frames(DEFAULT_SECONDS, start_fps)))
+    start_fps = max(5, min(start_fps, 24))
+
+    start_nf = int(base_payload.get("num_frames", _calc_frames(DEFAULT_SECONDS, start_fps)))
+    start_nf = max(81, min(start_nf, MAX_FRAMES_HARD))
 
     fps_order: List[int] = []
     for f in [start_fps, 24, 20, 16, 12, 8]:
+        f = max(5, min(int(f), 24))
         if f not in fps_order:
             fps_order.append(f)
 
-    frame_master = [121,112,104,96,88,81,72,64,60,56,48,40,36,32,28,24,20,16,12,8]
-    variants: List[Dict[str,int]] = []
+    frame_master = [100, 96, 92, 88, 84, 81]
+
+    variants: List[Dict[str, int]] = []
     for i, fps in enumerate(fps_order):
         if i == 0:
             start_q = _quantize_frames(start_nf)
@@ -125,14 +160,15 @@ def _predict_with_sla(model: str, base_payload: Dict[str,Any], tok: str) -> str:
         else:
             ladder = [x for x in frame_master if x <= _calc_frames(DEFAULT_SECONDS, fps)]
         for nf in ladder:
-            variants.append({"fps": int(fps), "nf": int(min(nf, MAX_FRAMES_HARD))})
+            nf_clamped = max(81, min(int(nf), MAX_FRAMES_HARD))
+            variants.append({"fps": int(fps), "nf": nf_clamped})
 
     for var in variants:
         payload = dict(base_payload)
         payload["frames_per_second"] = int(var["fps"])
         payload["num_frames"] = int(var["nf"])
 
-        for net_try in range(1, 3+1):
+        for net_try in range(1, 3 + 1):
             try:
                 r = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": payload}, tok)
                 get_url = (r.get("urls") or {}).get("get", "")
@@ -147,7 +183,16 @@ def _predict_with_sla(model: str, base_payload: Dict[str,Any], tok: str) -> str:
                         url = out[-1] if isinstance(out, list) and out else (out if isinstance(out, str) else "")
                         if not url:
                             raise RuntimeError("No output url")
-                        _log_json({"ok": True, "model": model, "payload": payload, "variant": var, "url": url, "ts": time.time()})
+                        _log_json(
+                            {
+                                "ok": True,
+                                "model": model,
+                                "payload": payload,
+                                "variant": var,
+                                "url": url,
+                                "ts": time.time(),
+                            }
+                        )
                         return url
                     if st == "failed":
                         attempts.append({"variant": var, "net_try": net_try, "status": "failed"})
@@ -167,6 +212,7 @@ def _predict_with_sla(model: str, base_payload: Dict[str,Any], tok: str) -> str:
     _log_json({"ok": False, "model": model, "base_payload": base_payload, "attempts": attempts, "ts": time.time()})
     raise ReplicateError("SLA: exhausted variants")
 
+
 def _ffmpeg_trim(src: Path, fps: int, seconds: float, warm_frames: int) -> Path:
     ss = warm_frames / max(1, fps)
     out = src.with_suffix(".trim.mp4")
@@ -178,15 +224,20 @@ def _ffmpeg_trim(src: Path, fps: int, seconds: float, warm_frames: int) -> Path:
     _run(cmd, check=True)
     return out
 
+
 def _ffmpeg_norm(src: Path, fps: int) -> Path:
     out = src.with_suffix(".final.mp4")
     vf = "scale=-2:720:flags=lanczos"
-    cmd = f"ffmpeg -y -i {shlex.quote(str(src))} -vf {shlex.quote(vf)} -r {int(fps)} -c:v libx264 -preset veryfast -movflags +faststart {shlex.quote(str(out))}"
+    cmd = (
+        f"ffmpeg -y -i {shlex.quote(str(src))} -vf {shlex.quote(vf)} -r {int(fps)} "
+        f"-c:v libx264 -preset veryfast -movflags +faststart {shlex.quote(str(out))}"
+    )
     _run(cmd, check=True)
     return out
 
+
 class ReplicateClient:
-    def __init__(self, token: Optional[str]=None):
+    def __init__(self, token: Optional[str] = None):
         self.token = token or _ensure_token()
 
     def _finalize(self, downloaded_path: Path, prefix: str, fps: int, seconds: float, warm_frames: int) -> Path:
@@ -196,26 +247,47 @@ class ReplicateClient:
         normalized.rename(final)
         return final
 
-    def generate_from_text(self, prompt: str, seconds: float=DEFAULT_SECONDS, fps: Optional[int]=None, seed: Optional[int]=None) -> str:
+    def generate_from_text(
+        self,
+        prompt: str,
+        seconds: float = DEFAULT_SECONDS,
+        fps: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ReplicateError("prompt is required")
         fps = int(fps or DEFAULT_FPS)
+        fps = max(5, min(fps, 24))
+
         warm_frames = max(1, round(WARMUP_SEC * fps))
         total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
+
         payload = {
             "prompt": f"{PROMPT_PRIMER}{prompt}",
             "num_frames": total_frames,
             "frames_per_second": fps,
             "seed": int(seed if seed is not None else FIXED_SEED),
         }
+
         url = _predict_with_sla(T2V_MODEL, payload, self.token)
         tmp = OUT_DIR / f"replicate_t2v_{int(time.time())}.dl.tmp.mp4"
         _download(url, tmp)
         final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps, seconds=seconds, warm_frames=warm_frames)
         return str(final_path)
 
-    def generate_from_image(self, image: str, prompt: str="", seconds: float=DEFAULT_SECONDS, fps: Optional[int]=None, seed: Optional[int]=None, strength: Optional[float]=None, denoise: Optional[float]=None) -> str:
+    def generate_from_image(
+        self,
+        image: str,
+        prompt: str = "",
+        seconds: float = DEFAULT_SECONDS,
+        fps: Optional[int] = None,
+        seed: Optional[int] = None,
+        strength: Optional[float] = None,
+        denoise: Optional[float] = None,
+    ) -> str:
         fps = int(fps or DEFAULT_FPS)
+        fps = max(5, min(fps, 24))
+
         warm_frames = max(1, round(WARMUP_SEC * fps))
         total_frames = min(MAX_FRAMES_HARD, _calc_frames(seconds, fps) + warm_frames)
 
@@ -236,6 +308,7 @@ class ReplicateClient:
             "strength": float(strength if strength is not None else os.getenv("REPLICATE_I2V_STRENGTH", "0.55")),
             "denoise": float(denoise if denoise is not None else os.getenv("REPLICATE_I2V_DENOISE", "0.35")),
         }
+
         url = _predict_with_sla(I2V_MODEL, payload, self.token)
         tmp = OUT_DIR / f"replicate_i2v_{int(time.time())}.dl.tmp.mp4"
         _download(url, tmp)
@@ -246,11 +319,13 @@ class ReplicateClient:
     def text(self, prompt: str) -> str:
         return self.generate_from_text(prompt)
 
-    def image(self, image: str, prompt: str="") -> str:
+    def image(self, image: str, prompt: str = "") -> str:
         return self.generate_from_image(image, prompt)
+
 
 if __name__ == "__main__":
     import argparse
+
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True, choices=["text", "image"])
     p.add_argument("--prompt", default="A cinematic shot, soft light")
