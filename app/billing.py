@@ -3,8 +3,10 @@ import sqlite3, os
 
 DB_PATH = os.getenv("DB_PATH", "/root/persobi.db")
 
+
 def _connect():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def _migrate(con):
     cur = con.cursor()
@@ -60,17 +62,23 @@ def _migrate(con):
         pass
     con.commit()
 
+
 def init_billing():
     con = _connect()
     _migrate(con)
     con.close()
 
+
 def ensure_user(user_id: int):
     con = _connect()
     cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(user_id, balance, preview_free_used) VALUES (?, 0, 0)", (user_id,))
+    cur.execute(
+        "INSERT OR IGNORE INTO users(user_id, balance, preview_free_used) VALUES (?, 0, 0)",
+        (user_id,),
+    )
     con.commit()
     con.close()
+
 
 def get_balance(user_id: int) -> int:
     con = _connect()
@@ -78,22 +86,31 @@ def get_balance(user_id: int) -> int:
     cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     con.close()
-    return row[0] if row else 0
+    return int(row[0]) if row and row[0] is not None else 0
+
 
 def add_balance(user_id: int, amount: int, reason="Пополнение"):
     con = _connect()
     cur = con.cursor()
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-    cur.execute("INSERT INTO wallet_ops(user_id, delta, reason) VALUES (?,?,?)", (user_id, amount, reason))
+    cur.execute(
+        "INSERT INTO wallet_ops(user_id, delta, reason) VALUES (?,?,?)",
+        (user_id, amount, reason),
+    )
     con.commit()
     con.close()
+
 
 def _inc_free_used(user_id: int):
     con = _connect()
     cur = con.cursor()
-    cur.execute("UPDATE users SET preview_free_used = preview_free_used + 1 WHERE user_id=?", (user_id,))
+    cur.execute(
+        "UPDATE users SET preview_free_used = COALESCE(preview_free_used, 0) + 1 WHERE user_id=?",
+        (user_id,),
+    )
     con.commit()
     con.close()
+
 
 def get_free_used(user_id: int) -> int:
     con = _connect()
@@ -101,10 +118,17 @@ def get_free_used(user_id: int) -> int:
     cur.execute("SELECT preview_free_used FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     con.close()
-    return int(row[0]) if row else 0
+    if not row or row[0] is None:
+        return 0
+    try:
+        return int(row[0])
+    except Exception:
+        return 0
+
 
 def can_take_free_preview(user_id: int) -> bool:
     return get_free_used(user_id) < 3
+
 
 def charge(user_id: int, job_id: int, amount: int) -> bool:
     bal = get_balance(user_id)
@@ -112,12 +136,18 @@ def charge(user_id: int, job_id: int, amount: int) -> bool:
         return False
     con = _connect()
     cur = con.cursor()
-    cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, user_id))
-    cur.execute("INSERT INTO charges(user_id, job_id, amount, status) VALUES (?,?,?,?)",
-                (user_id, job_id, amount, "captured"))
+    cur.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id=?",
+        (amount, user_id),
+    )
+    cur.execute(
+        "INSERT INTO charges(user_id, job_id, amount, status) VALUES (?,?,?,?)",
+        (user_id, job_id, amount, "captured"),
+    )
     con.commit()
     con.close()
     return True
+
 
 def register_preview_and_charge(user_id: int, duration_sec, sound_flag: int) -> (bool, int):
     """
@@ -126,11 +156,13 @@ def register_preview_and_charge(user_id: int, duration_sec, sound_flag: int) -> 
     ok=True и cost==0 — списание не требуется (бесплатные превью).
     ok=True и cost>0 — успешно списали cost.
     """
+    # сначала пробуем бесплатные превью
     if can_take_free_preview(user_id):
         _inc_free_used(user_id)
         return True, 0
 
     from app.pricing import price
+
     cost = price(duration_sec, sound_flag)
     if charge(user_id, 0, cost):
         return True, cost

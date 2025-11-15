@@ -189,6 +189,16 @@ def _cinema_prompt(user_text: str) -> str:
     return raw if raw else "Short daylight scene."
 
 
+def _sora2_prompt(base: str) -> str:
+    core = (base or "Short daylight scene.").strip()
+    return (
+        core
+        + " Keep exactly the same main person, face, outfit, body, background and lighting as in the original video. "
+        + "Do not change the outfit, do not add any new decorations or lights. "
+        + "Only add subtle, realistic camera motion and small natural movements."
+    )
+
+
 def _run(cmd: list[str]) -> bool:
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -251,24 +261,28 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
     """
-    Режем первые ~0.6 секунды, чтобы не было «рисования кисточкой».
+    Аккуратно режем первые ~0.3 секунды и перекодируем, чтобы не было
+    ощущения «рисования кисточкой» и рывка на первом кадре.
     При любой ошибке возвращаем исходный путь.
     """
     try:
         src = Path(path)
         if not src.exists():
             return path
-        cut_start = 0.6
+        cut_start = 0.3
         dst = src.with_suffix(".trim.mp4")
-        ok = _run([
+        cmd = [
             "ffmpeg",
             "-y",
             "-ss", str(cut_start),
             "-i", str(src),
-            "-c", "copy",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-movflags", "+faststart",
+            "-c:a", "copy",
             str(dst),
-        ])
-        if ok and dst.exists() and dst.stat().st_size > 0:
+        ]
+        if _run(cmd) and dst.exists() and dst.stat().st_size > 0:
             return str(dst)
         return path
     except Exception:
@@ -603,7 +617,8 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         seconds = int(p["dur"])
         sound = p["sound"]
         snd_flag = 1 if sound == "on" else 0
-        prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
+        base_prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
+        sora_prompt = _sora2_prompt(base_prompt)
 
         last_video = _get_last_video(bot_state, chat_id)
         last_img = _get_last_image(bot_state, chat_id)
@@ -633,21 +648,21 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 if not _try_ffmpeg_frame(last_video, frame):
                     raise RuntimeError("sora2 frame fail")
                 jpath = _reencode_to_jpeg(frame)
-                path = await _gen_from_image(jpath, prompt, seconds)
+                path = await _gen_from_image(jpath, sora_prompt, seconds)
             elif last_img and os.path.exists(last_img):
                 jpath = _reencode_to_jpeg(last_img)
-                path = await _gen_from_image(jpath, prompt, seconds)
+                path = await _gen_from_image(jpath, sora_prompt, seconds)
             elif last_prev and os.path.exists(last_prev):
                 frame = str(Path(last_prev).with_suffix(".jpg"))
                 if not _try_ffmpeg_frame(last_prev, frame):
                     raise RuntimeError("sora2 frame prev fail")
                 jpath = _reencode_to_jpeg(frame)
-                path = await _gen_from_image(jpath, prompt, seconds)
+                path = await _gen_from_image(jpath, sora_prompt, seconds)
             else:
-                path = await _gen_from_text(prompt, seconds)
+                path = await _gen_from_text(sora_prompt, seconds)
         except Exception as e:
             log.warning("[ui] sora2 error: %s", e)
-            path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+            path = await loop.run_in_executor(None, _offline.generate, sora_prompt, seconds)
 
         path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
