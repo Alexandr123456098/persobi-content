@@ -25,9 +25,13 @@ PROMPT_PRIMER = (
     "Start immediately with a sharp, fully resolved photorealistic frame from the very first frame. "
     "No fade-in, no drawing animation, no painterly brushstrokes, no plastic placeholder. "
     "Cinematic, stable exposure, no glitches. "
-    "Do NOT show fairy lights, garlands, Christmas lights, glowing decorations or bokeh garlands in the background. "
-    "When a reference image is provided, keep the same main person, face, body and camera angle, "
-    "and change only what is explicitly requested in the prompt. "
+)
+
+NEGATIVE_PROMPT = (
+    "fairy lights, Christmas lights, garlands, bokeh lights, glowing decorations, "
+    "twinkling bulbs, New Year lights, festive lights, tinsel, confetti, fireworks, sparkles, "
+    "different person, changed identity, different face, changed clothes, costume, fantasy outfit, "
+    "low quality, glitch, distortion, warped face, deformed body"
 )
 
 
@@ -92,8 +96,9 @@ def _download(url: str, dst: Path):
 
 
 def _upload_catbox(local_path: Path) -> str:
+    # -k, чтобы не падать на curl 60 (expired SSL)
     out = _run(
-        f"curl -fsS -F 'reqtype=fileupload' -F 'fileToUpload=@{shlex.quote(str(local_path))}' https://catbox.moe/user/api.php",
+        f"curl -k -fsS -F 'reqtype=fileupload' -F 'fileToUpload=@{shlex.quote(str(local_path))}' https://catbox.moe/user/api.php",
         check=True,
     ).stdout.decode().strip()
     if not out.startswith("http"):
@@ -226,7 +231,8 @@ def _predict_with_sla(model: str, base_payload: Dict[str, Any], tok: str) -> str
 
 def _ffmpeg_norm(src: Path, fps: int) -> Path:
     """
-    Нормализация без обрезки: берём как есть, гоним в 720p и нужный fps.
+    Нормализация без дополнительной обрезки: берём как есть, гоним в 720p и нужный fps.
+    Обрезку начала делаем уже в bot_ui_patch._apply_postprocess.
     """
     out = src.with_suffix(".final.mp4")
     vf = "scale=-2:720:flags=lanczos"
@@ -265,6 +271,7 @@ class ReplicateClient:
 
         payload = {
             "prompt": f"{PROMPT_PRIMER}{prompt}",
+            "negative_prompt": NEGATIVE_PROMPT,
             "num_frames": int(total_frames),
             "frames_per_second": int(fps),
             "seed": int(use_seed),
@@ -288,8 +295,9 @@ class ReplicateClient:
         denoise: Optional[float] = None,
     ) -> str:
         """
-        ВАЖНО: здесь тоже используем T2V_MODEL.
-        Картинка идёт как reference (url в prompt), без отдельной I2V-модели.
+        Используем I2V-модель Wan 2.2.
+        Картинка идёт в параметре `image` (url), prompt усиливаем текстово:
+        не менять человека, не добавлять гирлянды и прочий мусор.
         """
         fps = int(fps or DEFAULT_FPS)
         fps = max(5, min(fps, 24))
@@ -305,18 +313,24 @@ class ReplicateClient:
                 raise ReplicateError(f"Image not found: {image}")
             img_url = _upload_catbox(p)
 
-        full_prompt = f"{PROMPT_PRIMER}{prompt}".strip()
-        full_prompt = f"{full_prompt} Reference image: {img_url}"
+        full_prompt = (
+            f"{PROMPT_PRIMER}{prompt}".strip()
+            + " Use the input image as the base. Keep exactly the same main person, face, body, outfit, background and lighting. "
+            + "Do not change the outfit, do not change the background, do not add any lights, garlands or decorations. "
+            + "Only do what is explicitly described in the prompt (pose or action)."
+        )
 
         payload = {
             "prompt": full_prompt,
+            "image": img_url,
+            "negative_prompt": NEGATIVE_PROMPT,
             "num_frames": int(total_frames),
             "frames_per_second": int(fps),
             "seed": int(use_seed),
         }
 
         tok = self.token
-        url = _predict_with_sla(T2V_MODEL, payload, tok)
+        url = _predict_with_sla(I2V_MODEL, payload, tok)
         tmp = OUT_DIR / f"replicate_t2v_{int(time.time())}.dl.tmp.mp4"
         _download(url, tmp)
         final_path = self._finalize(tmp, "replicate_wanA_t2v", fps=fps)
