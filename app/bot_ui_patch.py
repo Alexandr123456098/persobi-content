@@ -194,8 +194,8 @@ def _sora2_prompt(base: str) -> str:
     return (
         core
         + " Keep exactly the same main person, face, outfit, body, background and lighting as in the original video. "
-        + "Do not change the outfit, do not add any new decorations or lights. "
-        + "Only add subtle, realistic camera motion and small natural movements."
+        + "Do not change the outfit, do not add any new decorations or lights, do not add extra people. "
+        + "Only add subtle, realistic camera motion and small natural movements, as one continuous forward shot without reverse or ping-pong."
     )
 
 
@@ -261,7 +261,7 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
     """
-    Аккуратно режем первые ~0.3 секунды и перекодируем, чтобы не было
+    Аккуратно режем первые ~0.15 секунды и перекодируем, чтобы не было
     ощущения «рисования кисточкой» и рывка на первом кадре.
     При любой ошибке возвращаем исходный путь.
     """
@@ -269,7 +269,7 @@ def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
         src = Path(path)
         if not src.exists():
             return path
-        cut_start = 0.3
+        cut_start = 0.15
         dst = src.with_suffix(".trim.mp4")
         cmd = [
             "ffmpeg",
@@ -611,8 +611,6 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
             )
 
     if data == "sora2_go":
-        await query.message.answer("🧩 Генерирую SORA 2…")
-
         p = _get_prefs(bot_state, chat_id)
         seconds = int(p["dur"])
         sound = p["sound"]
@@ -634,12 +632,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 reply_markup=kb,
             )
 
-        if not charge(chat_id, 0, cost):
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
-            return await query.message.answer("❌ Недостаточно средств для SORA2.", reply_markup=kb)
-
-        await query.message.answer(f"✅ SORA2: списано {cost} ₽. Генерирую…")
+        await query.message.answer("🧩 Генерирую SORA 2…")
 
         loop = asyncio.get_event_loop()
         try:
@@ -648,21 +641,34 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 if not _try_ffmpeg_frame(last_video, frame):
                     raise RuntimeError("sora2 frame fail")
                 jpath = _reencode_to_jpeg(frame)
-                path = await _gen_from_image(jpath, sora_prompt, seconds)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, sora_prompt, seconds)
             elif last_img and os.path.exists(last_img):
                 jpath = _reencode_to_jpeg(last_img)
-                path = await _gen_from_image(jpath, sora_prompt, seconds)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, sora_prompt, seconds)
             elif last_prev and os.path.exists(last_prev):
                 frame = str(Path(last_prev).with_suffix(".jpg"))
                 if not _try_ffmpeg_frame(last_prev, frame):
                     raise RuntimeError("sora2 frame prev fail")
                 jpath = _reencode_to_jpeg(frame)
-                path = await _gen_from_image(jpath, sora_prompt, seconds)
+                path = await loop.run_in_executor(None, _replicate.generate_from_image, jpath, sora_prompt, seconds)
             else:
-                path = await _gen_from_text(sora_prompt, seconds)
+                path = await loop.run_in_executor(None, _replicate.generate_from_text, sora_prompt, seconds)
         except Exception as e:
             log.warning("[ui] sora2 error: %s", e)
-            path = await loop.run_in_executor(None, _offline.generate, sora_prompt, seconds)
+            return await query.message.answer(
+                "❌ SORA2 сейчас не ответила: сервера провайдера перегружены, деньги не списаны. Попробуй чуть позже."
+            )
+
+        if not charge(chat_id, 0, cost):
+            bal = get_balance(chat_id)
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data="add_money"))
+            return await query.message.answer(
+                f"❌ Пока генерировали SORA2, баланс изменился.\nСтоимость: {cost} ₽\nБаланс: {bal} ₽",
+                reply_markup=kb,
+            )
+
+        await query.message.answer(f"✅ SORA2: списано {cost} ₽.")
 
         path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
