@@ -149,22 +149,55 @@ def charge(user_id: int, job_id: int, amount: int) -> bool:
     return True
 
 
-def register_preview_and_charge(user_id: int, duration_sec, sound_flag: int) -> (bool, int):
+# ---------- новый протокол превью: резерв + коммит ----------
+
+def plan_preview(user_id: int, duration_sec, sound_flag: int):
     """
-    Возвращает (ok, cost).
-    ok=False и cost>0 — недостаточно средств, необходимо пополнение на cost.
-    ok=True и cost==0 — списание не требуется (бесплатные превью).
-    ok=True и cost>0 — успешно списали cost.
+    Планируем превью, НИЧЕГО не списывая.
+
+    Возвращает (ok, cost, is_free, need_topup):
+
+      ok = False  -> не можем делать превью (баланса не хватает),
+                     cost = полная стоимость,
+                     need_topup = сколько не хватает (>=0).
+      ok = True, is_free = True, cost = 0  -> бесплатное превью, списаний не будет.
+      ok = True, is_free = False, cost > 0 -> платное превью, деньги ещё не списаны.
     """
-    # сначала пробуем бесплатные превью
     if can_take_free_preview(user_id):
-        _inc_free_used(user_id)
-        return True, 0
+        return True, 0, True, 0
 
     from app.pricing import price
 
     cost = price(duration_sec, sound_flag)
-    if charge(user_id, 0, cost):
-        return True, cost
-    else:
+    bal = get_balance(user_id)
+    if bal < cost:
+        return False, cost, False, max(0, cost - bal)
+    return True, cost, False, 0
+
+
+def commit_preview_charge(user_id: int, cost: int, is_free: bool) -> bool:
+    """
+    Фиксируем превью:
+      - если free -> увеличиваем счётчик бесплатных;
+      - если платное -> списываем cost (job_id=0).
+    """
+    if is_free:
+        _inc_free_used(user_id)
+        return True
+    if cost <= 0:
+        return True
+    return charge(user_id, 0, cost)
+
+
+# ---------- совместимость со старым кодом ----------
+
+def register_preview_and_charge(user_id: int, duration_sec, sound_flag: int) -> (bool, int):
+    """
+    Старый протокол: сначала проверка, потом сразу списание.
+    Оставлен для совместимости, новый код должен использовать plan_preview/commit_preview_charge.
+    """
+    ok, cost, is_free, _ = plan_preview(user_id, duration_sec, sound_flag)
+    if not ok:
         return False, cost
+    commit_preview_charge(user_id, cost, is_free)
+    return True, cost

@@ -14,7 +14,14 @@ from aiogram.utils.exceptions import InvalidQueryID
 
 from app.adapters.replicate_adapter import ReplicateClient
 from app.adapters.offline_adapter import OfflineClient
-from app.billing import ensure_user, get_balance, charge, register_preview_and_charge
+from app.billing import (
+    ensure_user,
+    get_balance,
+    charge,
+    register_preview_and_charge,
+    plan_preview,
+    commit_preview_charge,
+)
 from app.pricing import price
 
 log = logging.getLogger("ui")
@@ -261,15 +268,15 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
     """
-    Аккуратно режем первые ~0.15 секунды и перекодируем, чтобы не было
-    ощущения «рисования кисточкой» и рывка на первом кадре.
+    Аккуратно режем первые ~0.5 секунды и перекодируем, чтобы убрать
+    пережжённые «рисованные» кадры в начале.
     При любой ошибке возвращаем исходный путь.
     """
     try:
         src = Path(path)
         if not src.exists():
             return path
-        cut_start = 0.15
+        cut_start = 0.5
         dst = src.with_suffix(".trim.mp4")
         cmd = [
             "ffmpeg",
@@ -291,7 +298,11 @@ def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
 
 # ---------- GENERATORS ----------
 
-async def _gen_from_text(prompt: str, seconds: int) -> str:
+async def _gen_from_text(prompt: str, seconds: int, paid: bool) -> str:
+    """
+    paid=True  -> при падении провайдера кидаем исключение (чтобы не брать деньги и не слать заглушку).
+    paid=False -> можно спокойно уйти в offline-заглушку.
+    """
     _ensure_clients()
     loop = asyncio.get_event_loop()
     try:
@@ -300,10 +311,15 @@ async def _gen_from_text(prompt: str, seconds: int) -> str:
         return path
     except Exception as e:
         log.warning("[ui] replicate(text) failed: %s", e)
+        if paid:
+            raise
         return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
 
-async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
+async def _gen_from_image(img_path: str, prompt: str, seconds: int, paid: bool) -> str:
+    """
+    Аналогично _gen_from_text: для платных превью при падении репликейта кидаем исключение.
+    """
     _ensure_clients()
     loop = asyncio.get_event_loop()
     try:
@@ -312,6 +328,8 @@ async def _gen_from_image(img_path: str, prompt: str, seconds: int) -> str:
         return path
     except Exception as e:
         log.warning("[ui] replicate(image) failed: %s", e)
+        if paid:
+            raise
         return await loop.run_in_executor(None, _offline.generate, prompt, seconds)
 
 
@@ -333,7 +351,7 @@ async def handle_text(message: types.Message, bot_state):
     seconds = int(p["dur"])
     snd_flag = 1 if p["sound"] == "on" else 0
 
-    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    ok, cost, is_free, need_topup = plan_preview(chat_id, seconds, snd_flag)
     if not ok:
         bal = get_balance(chat_id)
         kb = InlineKeyboardMarkup()
@@ -343,14 +361,28 @@ async def handle_text(message: types.Message, bot_state):
             reply_markup=kb,
         )
 
-    if cost > 0:
-        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    paid = (not is_free and cost > 0)
+
+    if paid:
+        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
     else:
         await message.answer("🎬 Генерирую превью…")
 
-    path = await _gen_from_text(prompt, seconds)
-    path = _apply_postprocess(path, seconds, p["sound"])
+    try:
+        path = await _gen_from_text(prompt, seconds, paid=paid)
+    except Exception:
+        if paid:
+            return await message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+            )
+        return await message.answer(
+            "❌ Сейчас провайдер перегружен, превью не удалось сделать. Попробуй чуть позже."
+        )
 
+    if not commit_preview_charge(chat_id, cost, is_free):
+        log.warning("commit_preview_charge failed for user %s", chat_id)
+
+    path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
@@ -368,7 +400,7 @@ async def handle_photo(message: types.Message, bot_state):
     seconds = int(p["dur"])
     snd_flag = 1 if p["sound"] == "on" else 0
 
-    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    ok, cost, is_free, need_topup = plan_preview(chat_id, seconds, snd_flag)
     if not ok:
         bal = get_balance(chat_id)
         kb = InlineKeyboardMarkup()
@@ -378,8 +410,10 @@ async def handle_photo(message: types.Message, bot_state):
             reply_markup=kb,
         )
 
-    if cost > 0:
-        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    paid = (not is_free and cost > 0)
+
+    if paid:
+        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
     else:
         await message.answer("🎬 Генерирую превью…")
 
@@ -401,10 +435,24 @@ async def handle_photo(message: types.Message, bot_state):
             raise RuntimeError("no photo/document")
 
         jpath = _reencode_to_jpeg(tmp_path)
-        path = await _gen_from_image(jpath, caption, seconds)
+
+        try:
+            path = await _gen_from_image(jpath, caption, seconds, paid=paid)
+        except Exception:
+            if paid:
+                return await message.answer(
+                    "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+                )
+            return await message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Попробуй чуть позже."
+            )
 
     except Exception as e:
         log.warning("[ui] photo error: %s", e)
+        if paid:
+            return await message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+            )
         path = await loop.run_in_executor(None, _offline.generate, caption, seconds)
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -415,6 +463,9 @@ async def handle_photo(message: types.Message, bot_state):
 
     if jpath:
         _set_last_image(bot_state, chat_id, jpath)
+
+    if not commit_preview_charge(chat_id, cost, is_free):
+        log.warning("commit_preview_charge failed for user %s", chat_id)
 
     path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
@@ -434,7 +485,7 @@ async def handle_video(message: types.Message, bot_state):
     seconds = int(p["dur"])
     snd_flag = 1 if p["sound"] == "on" else 0
 
-    ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+    ok, cost, is_free, need_topup = plan_preview(chat_id, seconds, snd_flag)
     if not ok:
         bal = get_balance(chat_id)
         kb = InlineKeyboardMarkup()
@@ -444,8 +495,10 @@ async def handle_video(message: types.Message, bot_state):
             reply_markup=kb,
         )
 
-    if cost > 0:
-        await message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+    paid = (not is_free and cost > 0)
+
+    if paid:
+        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
     else:
         await message.answer("🎬 Генерирую превью…")
 
@@ -464,10 +517,24 @@ async def handle_video(message: types.Message, bot_state):
             raise RuntimeError("frame extract failed")
 
         jpath = _reencode_to_jpeg(frame_jpg)
-        path = await _gen_from_image(jpath, caption, seconds)
+
+        try:
+            path = await _gen_from_image(jpath, caption, seconds, paid=paid)
+        except Exception:
+            if paid:
+                return await message.answer(
+                    "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+                )
+            return await message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Попробуй чуть позже."
+            )
 
     except Exception as e:
         log.warning("[ui] video error: %s", e)
+        if paid:
+            return await message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+            )
         path = await loop.run_in_executor(None, _offline.generate, caption, seconds)
     finally:
         if frame_jpg and os.path.exists(frame_jpg):
@@ -475,6 +542,9 @@ async def handle_video(message: types.Message, bot_state):
                 os.remove(frame_jpg)
             except Exception:
                 pass
+
+    if not commit_preview_charge(chat_id, cost, is_free):
+        log.warning("commit_preview_charge failed for user %s", chat_id)
 
     path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
@@ -573,7 +643,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         seconds = int(p["dur"])
         snd_flag = 1 if p["sound"] == "on" else 0
 
-        ok, cost = register_preview_and_charge(chat_id, seconds, snd_flag)
+        ok, cost, is_free, need_topup = plan_preview(chat_id, seconds, snd_flag)
         if not ok:
             bal = get_balance(chat_id)
             kb = InlineKeyboardMarkup()
@@ -583,8 +653,10 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
                 reply_markup=kb,
             )
 
-        if cost > 0:
-            await query.message.answer(f"✅ Списано {cost} ₽. Генерирую превью…")
+        paid = (not is_free and cost > 0)
+
+        if paid:
+            await query.message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
         else:
             await query.message.answer("🎬 Генерирую превью…")
 
@@ -595,11 +667,20 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         try:
             if last_img and os.path.exists(last_img):
                 jpath = _reencode_to_jpeg(last_img)
-                path = await _gen_from_image(jpath, prompt, seconds)
+                path = await _gen_from_image(jpath, prompt, seconds, paid=paid)
             else:
-                path = await _gen_from_text(prompt, seconds)
+                path = await _gen_from_text(prompt, seconds, paid=paid)
         except Exception:
-            path = await loop.run_in_executor(None, _offline.generate, prompt, seconds)
+            if paid:
+                return await query.message.answer(
+                    "❌ Сейчас провайдер перегружен, превью не удалось сделать. Деньги не списаны, попробуй чуть позже."
+                )
+            return await query.message.answer(
+                "❌ Сейчас провайдер перегружен, превью не удалось сделать. Попробуй чуть позже."
+            )
+
+        if not commit_preview_charge(chat_id, cost, is_free):
+            log.warning("commit_preview_charge failed for user %s", chat_id)
 
         path = _apply_postprocess(path, seconds, p["sound"])
         _store_preview_and_reply_path(bot_state, chat_id, path)
