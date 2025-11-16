@@ -254,7 +254,17 @@ class ReplicateClient:
     ) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ReplicateError("prompt is required")
-        fps = int(fps or DEFAULT_FPS)
+
+        # Честные длительности:
+        #   ~5 секунд => 100 кадров @ 20 fps
+        #   ~10 секунд => 100 кадров @ 10 fps
+        if fps is None:
+            if float(seconds) >= 9.0:
+                fps = 10
+            else:
+                fps = 20
+
+        fps = int(fps)
         fps = max(5, min(fps, 24))
 
         total_frames = _calc_frames(seconds, fps)
@@ -285,7 +295,14 @@ class ReplicateClient:
         strength: Optional[float] = None,
         denoise: Optional[float] = None,
     ) -> str:
-        fps = int(fps or DEFAULT_FPS)
+        # Те же правила длительности, что и для текста
+        if fps is None:
+            if float(seconds) >= 9.0:
+                fps = 10
+            else:
+                fps = 20
+
+        fps = int(fps)
         fps = max(5, min(fps, 24))
 
         total_frames = _calc_frames(seconds, fps)

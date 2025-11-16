@@ -120,7 +120,8 @@ def _get_prefs(state, chat_id: int) -> dict:
         prefs = {"dur": DEFAULT_DUR, "sound": "off"}
         _get_box(state, "prefs")[chat_id] = prefs
     prefs["dur"] = int(prefs.get("dur", DEFAULT_DUR))
-    if prefs["dur"] not in (5, 7, 10):
+    # Разрешаем только честные 5 и 10 секунд
+    if prefs["dur"] not in (5, 10):
         prefs["dur"] = 5
     s = str(prefs.get("sound", "off")).lower()
     prefs["sound"] = "on" if s in ("on", "1", "true", "yes") else "off"
@@ -141,12 +142,14 @@ def _sora2_price(seconds: int, sound_flag: int) -> int:
     SORA2 = премиум «Ещё раз».
 
     Тарифы:
-      5 сек, без звука  — 75 ₽
-      5 сек, со звуком  — 100 ₽
-      7.5 сек, без звука — 125 ₽
-      7.5 сек, со звуком — 150 ₽
+      5 сек, без звука   —  75 ₽
+      5 сек, со звуком   — 100 ₽
+      10 сек, без звука  — 125 ₽
+      10 сек, со звуком  — 150 ₽
+    Логика: всё, что до ~6 секунд, считаем как 5с-тариф;
+            всё, что 6 и выше — как 10с-тариф.
     """
-    sec_norm = 5 if seconds <= 5 else 8
+    sec_norm = 5 if seconds <= 6 else 10
     snd = 1 if sound_flag else 0
 
     if sec_norm == 5:
@@ -179,8 +182,8 @@ def kb_ready():
 def kb_menu_config(state, chat_id: int):
     kb = InlineKeyboardMarkup(row_width=2)
     if FEATURE_DURATION_SOUND_MENU:
-        kb.row(InlineKeyboardButton("⏱ 7.5 сек", callback_data="dur_set75"))
         kb.row(InlineKeyboardButton("⏱ 5 сек", callback_data="dur_set5"))
+        kb.row(InlineKeyboardButton("⏱ 10 сек", callback_data="dur_set10"))
         kb.row(
             InlineKeyboardButton("🎙 Со звуком", callback_data="sound_on"),
             InlineKeyboardButton("🔇 Без звука", callback_data="sound_off"),
@@ -363,10 +366,8 @@ async def handle_text(message: types.Message, bot_state):
 
     paid = (not is_free and cost > 0)
 
-    if paid:
-        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
-    else:
-        await message.answer("🎬 Генерирую превью…")
+    # Без «Резервирую ХХ ₽…» — просто честное действие
+    await message.answer("🎬 Генерирую превью…")
 
     try:
         path = await _gen_from_text(prompt, seconds, paid=paid)
@@ -412,10 +413,7 @@ async def handle_photo(message: types.Message, bot_state):
 
     paid = (not is_free and cost > 0)
 
-    if paid:
-        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
-    else:
-        await message.answer("🎬 Генерирую превью…")
+    await message.answer("🎬 Генерирую превью…")
 
     p = _get_prefs(bot_state, chat_id)
     seconds = int(p["dur"])
@@ -497,10 +495,7 @@ async def handle_video(message: types.Message, bot_state):
 
     paid = (not is_free and cost > 0)
 
-    if paid:
-        await message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
-    else:
-        await message.answer("🎬 Генерирую превью…")
+    await message.answer("🎬 Генерирую превью…")
 
     loop = asyncio.get_event_loop()
     tmp_video = None
@@ -571,9 +566,9 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
         _set_pref(bot_state, chat_id, "dur", 5)
         return await query.message.answer("⏱ 5 сек.")
 
-    if data == "dur_set75":
-        _set_pref(bot_state, chat_id, "dur", 7)
-        return await query.message.answer("⏱ 7.5 сек.")
+    if data == "dur_set10":
+        _set_pref(bot_state, chat_id, "dur", 10)
+        return await query.message.answer("⏱ 10 сек.")
 
     if data == "sound_on":
         _set_pref(bot_state, chat_id, "sound", "on")
@@ -655,10 +650,7 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
 
         paid = (not is_free and cost > 0)
 
-        if paid:
-            await query.message.answer(f"✅ Резервирую {cost} ₽. Генерирую превью…")
-        else:
-            await query.message.answer("🎬 Генерирую превью…")
+        await query.message.answer("🎬 Генерирую превью…")
 
         prompt = _get_last_prompt(bot_state, chat_id, default="Short daylight scene.")
         last_img = _get_last_image(bot_state, chat_id)
