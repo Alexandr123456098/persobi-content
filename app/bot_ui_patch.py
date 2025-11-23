@@ -122,7 +122,7 @@ def _get_prefs(state, chat_id: int) -> dict:
     prefs["dur"] = int(prefs.get("dur", DEFAULT_DUR))
     # Разрешаем только честные 5 и 10 секунд
     if prefs["dur"] not in (5, 10):
-        prefs["dur"] = 5
+        prefs["dur"] = DEFAULT_DUR
     s = str(prefs.get("sound", "off")).lower()
     prefs["sound"] = "on" if s in ("on", "1", "true", "yes") else "off"
     _get_box(state, "prefs")[chat_id] = prefs
@@ -133,6 +133,15 @@ def _set_pref(state, chat_id: int, key: str, value):
     prefs = _get_prefs(state, chat_id)
     prefs[key] = value
     _get_box(state, "prefs")[chat_id] = prefs
+
+
+def _reset_prefs_to_default(state, chat_id: int):
+    """
+    После любой успешной генерации возвращаемся к базовым настройкам:
+    5 секунд, без звука.
+    """
+    _set_pref(state, chat_id, "dur", DEFAULT_DUR)
+    _set_pref(state, chat_id, "sound", "off")
 
 
 # ---------- pricing helpers ----------
@@ -271,32 +280,9 @@ def _store_preview_and_reply_path(bot_state, chat_id: int, path: str):
 
 def _apply_postprocess(path: str, seconds: int, sound: str) -> str:
     """
-    Аккуратно режем первые ~0.5 секунды и перекодируем, чтобы убрать
-    пережжённые «рисованные» кадры в начале.
-    При любой ошибке возвращаем исходный путь.
+    Сейчас не трогаем ролик: длина должна быть максимально честной.
     """
-    try:
-        src = Path(path)
-        if not src.exists():
-            return path
-        cut_start = 0.5
-        dst = src.with_suffix(".trim.mp4")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss", str(cut_start),
-            "-i", str(src),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-movflags", "+faststart",
-            "-c:a", "copy",
-            str(dst),
-        ]
-        if _run(cmd) and dst.exists() and dst.stat().st_size > 0:
-            return str(dst)
-        return path
-    except Exception:
-        return path
+    return path
 
 
 # ---------- GENERATORS ----------
@@ -366,7 +352,6 @@ async def handle_text(message: types.Message, bot_state):
 
     paid = (not is_free and cost > 0)
 
-    # Без «Резервирую ХХ ₽…» — просто честное действие
     await message.answer("🎬 Генерирую превью…")
 
     try:
@@ -385,6 +370,8 @@ async def handle_text(message: types.Message, bot_state):
 
     path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
+    _reset_prefs_to_default(bot_state, chat_id)
+
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
 
@@ -467,6 +454,8 @@ async def handle_photo(message: types.Message, bot_state):
 
     path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
+    _reset_prefs_to_default(bot_state, chat_id)
+
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
 
@@ -543,6 +532,8 @@ async def handle_video(message: types.Message, bot_state):
 
     path = _apply_postprocess(path, seconds, p["sound"])
     _store_preview_and_reply_path(bot_state, chat_id, path)
+    _reset_prefs_to_default(bot_state, chat_id)
+
     with open(path, "rb") as f:
         await message.answer_video(f, caption="✅ Готово. Предпросмотр:", reply_markup=kb_ready())
 
@@ -676,6 +667,8 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
 
         path = _apply_postprocess(path, seconds, p["sound"])
         _store_preview_and_reply_path(bot_state, chat_id, path)
+        _reset_prefs_to_default(bot_state, chat_id)
+
         with open(path, "rb") as f:
             return await query.message.answer_video(
                 f,
@@ -745,6 +738,8 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
 
         path = _apply_postprocess(path, seconds, sound)
         _store_preview_and_reply_path(bot_state, chat_id, path)
+        _reset_prefs_to_default(bot_state, chat_id)
+
         with open(path, "rb") as f:
             return await query.message.answer_video(
                 f,

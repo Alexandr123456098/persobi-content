@@ -145,83 +145,55 @@ def _make_seed(seed: Optional[int]) -> int:
 
 
 def _predict_with_sla(model: str, base_payload: Dict[str, Any], tok: str) -> str:
+    """
+    Упрощённый предикт без лестниц fps/кадров.
+    Делаем до 3 сетевых попыток с теми же параметрами.
+    """
     attempts: List[Dict[str, Any]] = []
+    payload = dict(base_payload)
 
-    start_fps = int(base_payload.get("frames_per_second", DEFAULT_FPS))
-    start_fps = max(5, min(start_fps, 24))
+    for net_try in range(1, 3 + 1):
+        try:
+            r = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": payload}, tok)
+            get_url = (r.get("urls") or {}).get("get", "")
+            if not get_url:
+                raise RuntimeError("No urls.get in create response")
 
-    start_nf = int(base_payload.get("num_frames", _calc_frames(DEFAULT_SECONDS, start_fps)))
-    start_nf = max(81, min(start_nf, MAX_FRAMES_HARD))
-
-    fps_order: List[int] = []
-    for f in [start_fps, 24, 20, 16, 12, 8]:
-        f = max(5, min(int(f), 24))
-        if f not in fps_order:
-            fps_order.append(f)
-
-    frame_master = [100, 96, 92, 88, 84, 81]
-
-    variants: List[Dict[str, int]] = []
-    for i, fps in enumerate(fps_order):
-        if i == 0:
-            start_q = _quantize_frames(start_nf)
-            ladder = [x for x in frame_master if x <= start_q]
-            if start_q not in ladder:
-                ladder = [start_q] + ladder
-        else:
-            ladder = [x for x in frame_master if x <= _calc_frames(DEFAULT_SECONDS, fps)]
-        for nf in ladder:
-            nf_clamped = max(81, min(int(nf), MAX_FRAMES_HARD))
-            variants.append({"fps": int(fps), "nf": nf_clamped})
-
-    for var in variants:
-        payload = dict(base_payload)
-        payload["frames_per_second"] = int(var["fps"])
-        payload["num_frames"] = int(var["nf"])
-
-        for net_try in range(1, 3 + 1):
-            try:
-                r = _post_json(f"{API_BASE}/models/{model}/predictions", {"input": payload}, tok)
-                get_url = (r.get("urls") or {}).get("get", "")
-                if not get_url:
-                    raise RuntimeError("No urls.get in create response")
-
-                while True:
-                    s = _get_json(get_url, tok)
-                    st = s.get("status")
-                    if st == "succeeded":
-                        out = s.get("output")
-                        url = out[-1] if isinstance(out, list) and out else (out if isinstance(out, str) else "")
-                        if not url:
-                            raise RuntimeError("No output url")
-                        _log_json(
-                            {
-                                "ok": True,
-                                "model": model,
-                                "payload": payload,
-                                "variant": var,
-                                "url": url,
-                                "ts": time.time(),
-                            }
-                        )
-                        return url
-                    if st == "failed":
-                        attempts.append({"variant": var, "net_try": net_try, "status": "failed"})
-                        break
-                    time.sleep(1.5)
-            except Exception as e:
-                if net_try < 3:
-                    _log_json({"retry": True, "variant": var, "error": str(e), "ts": time.time()})
-                    time.sleep(0.8)
-                    continue
-                if _is_422(e) or "validation" in str(e).lower():
-                    attempts.append({"variant": var, "net_try": net_try, "status": "422"})
+            while True:
+                s = _get_json(get_url, tok)
+                st = s.get("status")
+                if st == "succeeded":
+                    out = s.get("output")
+                    url = out[-1] if isinstance(out, list) and out else (out if isinstance(out, str) else "")
+                    if not url:
+                        raise RuntimeError("No output url")
+                    _log_json(
+                        {
+                            "ok": True,
+                            "model": model,
+                            "payload": payload,
+                            "url": url,
+                            "ts": time.time(),
+                        }
+                    )
+                    return url
+                if st == "failed":
+                    attempts.append({"net_try": net_try, "status": "failed"})
                     break
-                attempts.append({"variant": var, "net_try": net_try, "status": "error", "error": str(e)})
+                time.sleep(1.5)
+        except Exception as e:
+            if net_try < 3:
+                _log_json({"retry": True, "error": str(e), "ts": time.time()})
+                time.sleep(0.8)
+                continue
+            if _is_422(e) or "validation" in str(e).lower():
+                attempts.append({"net_try": net_try, "status": "422", "error": str(e)})
                 break
+            attempts.append({"net_try": net_try, "status": "error", "error": str(e)})
+            break
 
     _log_json({"ok": False, "model": model, "base_payload": base_payload, "attempts": attempts, "ts": time.time()})
-    raise ReplicateError("SLA: exhausted variants")
+    raise ReplicateError("provider overloaded or unavailable")
 
 
 def _ffmpeg_norm(src: Path, fps: int) -> Path:
@@ -256,18 +228,18 @@ class ReplicateClient:
             raise ReplicateError("prompt is required")
 
         # Честные длительности:
-        #   ~5 секунд => 100 кадров @ 20 fps
-        #   ~10 секунд => 100 кадров @ 10 fps
-        if fps is None:
-            if float(seconds) >= 9.0:
-                fps = 10
-            else:
-                fps = 20
+        #   5 секунд  => 100 кадров @ 20 fps
+        #   10 секунд => 100 кадров @ 10 fps
+        if float(seconds) >= 9.0:
+            fps = 10
+            total_frames = 100
+        else:
+            fps = 20
+            total_frames = 100
 
         fps = int(fps)
         fps = max(5, min(fps, 24))
 
-        total_frames = _calc_frames(seconds, fps)
         use_seed = _make_seed(seed)
 
         payload = {
@@ -295,17 +267,19 @@ class ReplicateClient:
         strength: Optional[float] = None,
         denoise: Optional[float] = None,
     ) -> str:
-        # Те же правила длительности, что и для текста
-        if fps is None:
-            if float(seconds) >= 9.0:
-                fps = 10
-            else:
-                fps = 20
+        # Те же правила длительности, что и для текста:
+        #   5 секунд  => 100 кадров @ 20 fps
+        #   10 секунд => 100 кадров @ 10 fps
+        if float(seconds) >= 9.0:
+            fps = 10
+            total_frames = 100
+        else:
+            fps = 20
+            total_frames = 100
 
         fps = int(fps)
         fps = max(5, min(fps, 24))
 
-        total_frames = _calc_frames(seconds, fps)
         use_seed = _make_seed(seed)
 
         if image.lower().startswith("http://") or image.lower().startswith("https://"):
