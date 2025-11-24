@@ -26,38 +26,51 @@ _replicate = None
 
 
 def _ensure_clients():
+    """Гарантируем создание клиента Replicate один раз."""
     global _replicate
     if _replicate is None:
         _replicate = ReplicateClient()
 
 
 def _postprocess(path: str) -> str:
-    """Убираем пережжённые первые кадры + нормализуем до 24fps / 720p"""
+    """Обрезаем первые кадры + нормализуем до 24fps + 720p."""
     src = Path(path)
     final = src.with_suffix(".fx.mp4")
+
     cmd = (
-        f"ffmpeg -y -i {src} "
+        f"ffmpeg -y -i \"{src}\" "
         f"-ss {CUT_START} "
         f"-vf scale=-2:720:flags=lanczos "
         f"-r {FPS_FINAL} "
         f"-c:v libx264 -preset veryfast -movflags +faststart "
-        f"{final}"
+        f"\"{final}\""
     )
+
     try:
         subprocess.run(cmd, shell=True, check=True)
     except Exception as e:
         log.error("postprocess: %s", e)
-        return path
+        return str(src)
+
     return str(final)
 
 
 async def _generate(prompt: str, seconds: int, image: str | None):
-    """WAN 2.2 генерация (только replicate)"""
+    """WAN 2.2 генерация через Replicate."""
     _ensure_clients()
+
     if image:
-        out = _replicate.generate_from_image(image=image, prompt=prompt, seconds=seconds)
+        out = _replicate.generate_from_image(
+            image=image,
+            prompt=prompt,
+            seconds=seconds,
+        )
     else:
-        out = _replicate.generate_from_text(prompt=prompt, seconds=seconds)
+        out = _replicate.generate_from_text(
+            prompt=prompt,
+            seconds=seconds,
+        )
+
     return _postprocess(out)
 
 
@@ -77,17 +90,16 @@ def _menu():
 
 
 async def _preview(user_id: int, prompt: str, seconds: int, sound: int):
-    """Stub превью (чёрный фон + PREVIEW)"""
+    """Абсолютно стабильный предпросмотр — чёрный фон без drawtext."""
     ok, cost, is_free, need = plan_preview(user_id, seconds, sound)
     if not ok:
         return f"❌ Не хватает средств. Нужно {cost} ₽, нехватает {need} ₽."
 
     tmp = Path(tempfile.mkdtemp()) / "preview.mp4"
+
     cmd = (
-        f"ffmpeg -f lavfi -i color=c=black:s=720x720:d={seconds} "
-        f"-vf drawtext=text='PREVIEW':fontcolor=white:fontsize=64:"
-        f"x=(w-text_w)/2:y=(h-text_h)/2 "
-        f"-c:v libx264 -pix_fmt yuv420p {tmp}"
+        f"ffmpeg -y -f lavfi -i color=c=black:s=720x720:d={seconds} "
+        f"-c:v libx264 -pix_fmt yuv420p \"{tmp}\""
     )
 
     try:
@@ -103,6 +115,7 @@ async def _preview(user_id: int, prompt: str, seconds: int, sound: int):
 
 
 async def _send_preview(message: types.Message, path: str):
+    """Отправка предпросмотра пользователю."""
     try:
         await message.answer_video(open(path, "rb"), caption="🎬 Предпросмотр.")
     except Exception as e:
@@ -111,6 +124,7 @@ async def _send_preview(message: types.Message, path: str):
 
 
 async def handle_text(message: types.Message, bot_state):
+    """Пользователь отправил текст — генерируем превью."""
     user = message.from_user.id
     ensure_user(user)
 
@@ -120,6 +134,7 @@ async def handle_text(message: types.Message, bot_state):
     await message.answer("🟡 Готовлю предпросмотр…", reply_markup=_menu())
 
     prev = await _preview(user, prompt, DEFAULT_DURATION, 0)
+
     if prev.endswith(".mp4"):
         await _send_preview(message, prev)
     else:
@@ -127,6 +142,7 @@ async def handle_text(message: types.Message, bot_state):
 
 
 async def handle_photo(message: types.Message, bot_state):
+    """Фотография для image-to-video."""
     user = message.from_user.id
     ensure_user(user)
 
@@ -135,10 +151,12 @@ async def handle_photo(message: types.Message, bot_state):
     await ph.download(tmp)
 
     bot_state["last_image"][user] = str(tmp)
+
     await message.answer("🟡 Фото получено. Введи описание сцены.", reply_markup=_menu())
 
 
 async def _sora2(message: types.Message, bot_state):
+    """Усиленный режим SORA 2."""
     user = message.from_user.id
     ensure_user(user)
 
@@ -148,7 +166,6 @@ async def _sora2(message: types.Message, bot_state):
         return
 
     img = bot_state["last_image"].get(user)
-
     await message.answer("🧩 Генерирую SORA 2…")
 
     try:
@@ -160,6 +177,7 @@ async def _sora2(message: types.Message, bot_state):
 
 
 async def handle_callback(query: types.CallbackQuery, bot_state):
+    """Кнопки бота."""
     user = query.from_user.id
     ensure_user(user)
 
@@ -168,12 +186,16 @@ async def handle_callback(query: types.CallbackQuery, bot_state):
     try:
         if data == "again":
             await query.answer()
+
             prompt = bot_state["last_prompt"].get(user)
             img = bot_state["last_image"].get(user)
+
             if not prompt:
                 await query.message.answer("Сначала текст.")
                 return
+
             await query.message.answer("🔁 Генерирую…")
+
             out = await _generate(prompt, DEFAULT_DURATION, img)
             await _send_preview(query.message, out)
             return
