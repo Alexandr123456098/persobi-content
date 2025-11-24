@@ -1,58 +1,55 @@
-import asyncio, logging, uvloop
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
-from .config import settings
-from .prompting import build_director_prompt
+# -*- coding: utf-8 -*-
+import asyncio
+import logging
+import uvloop
+from pathlib import Path
+from aiogram import Dispatcher
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-bot = Bot(token=settings.bot_token)
-dp = Dispatcher()
+# Берём dp и bot из bot_ui_patch (главная логика здесь)
+from app.bot_ui_patch import dp, bot
 
-HELLO = (
-"Привет! Я соберу режиссёрский промпт под твою идею и предложу 1/2/3 видео.\n"
-"Напиши мысль (например: «хочу видео с бабушкой на веранде летом»). "
-"Также можешь отправить фото + подпись — учту детали из текста."
+LOG_DIR = Path("/opt/content_factory/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "main.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8")
+    ],
 )
 
-@dp.message(CommandStart())
-async def on_start(m: Message):
-    await m.answer(HELLO)
+log = logging.getLogger("main")
+log.info("main.py loaded")
 
-@dp.message(Command("cancel"))
-async def on_cancel(m: Message):
-    await m.answer("Сбросил. Готов к новой идее.")
 
-@dp.message(F.photo)
-async def on_photo(m: Message):
-    caption = (m.caption or "").strip()
-    if not caption:
-        await m.answer("Добавь подпись к фото — текст задаёт замысел.")
-        return
-    await _handle_idea(m, caption)
+async def on_startup(dispatcher: Dispatcher):
+    try:
+        me = await dispatcher.bot.get_me()
+        log.info("Bot started: %s @%s", me.first_name, me.username)
+    except Exception as e:
+        log.warning("get_me failed: %s", e)
 
-@dp.message(F.text & ~F.via_bot)
-async def on_text(m: Message):
-    text = m.text.strip()
-    # комманда выбора количества видео — простая заглушка
-    if text in ("1", "2", "3"):
-        await m.answer(f"Окей, генерирую {text} видео (заглушка). Дальше подключим провайдер видео.")
-        return
-    await _handle_idea(m, text)
-
-async def _handle_idea(m: Message, idea: str):
-    await m.answer("Думаю над режиссёрским промптом…")
-    prompt = await build_director_prompt(idea)
-    reply = (
-        "Вот твой режиссёрский промпт (копируй куда хочешь):\n\n"
-        f"{prompt}\n\n"
-        "Сколько видео сделать: *1*, *2* или *3*?"
-    )
-    await m.answer(reply, parse_mode="Markdown")
 
 def main():
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    asyncio.run(dp.start_polling(bot, allowed_updates=["message", "edited_message"]))
+    uvloop.install()
+    log.info("Polling start")
+    from aiogram import executor
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup,
+        allowed_updates=[
+            "message",
+            "edited_message",
+            "callback_query",
+            "inline_query"
+        ]
+    )
+
 
 if __name__ == "__main__":
     main()
