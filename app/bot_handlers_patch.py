@@ -5,7 +5,6 @@ from aiogram import types, Dispatcher
 from app.bot_ui_patch import (
     handle_text,
     handle_photo,
-    handle_video,
     handle_callback,
 )
 
@@ -29,14 +28,6 @@ def setup_handlers(dp: Dispatcher):
         except Exception as e:
             log.error("photo handler: %s", e)
             await message.answer("Ошибка обработки фото.")
-
-    @dp.message_handler(content_types=["video"])
-    async def _video(message: types.Message, bot_state):
-        try:
-            await handle_video(message, bot_state)
-        except Exception as e:
-            log.error("video handler: %s", e)
-            await message.answer("Ошибка обработки видео.")
 
     @dp.callback_query_handler()
     async def _cb(query: types.CallbackQuery, bot_state):
