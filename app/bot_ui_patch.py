@@ -4,7 +4,6 @@ import asyncio
 import logging
 import tempfile
 import subprocess
-import shutil
 from pathlib import Path
 
 from aiogram import types
@@ -12,7 +11,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.exceptions import InvalidQueryID
 
 from app.adapters.replicate_adapter import ReplicateClient
-from app.adapters.offline_adapter import OfflineClient
 from app.billing import ensure_user, plan_preview, commit_preview_charge
 
 log = logging.getLogger("ui")
@@ -20,214 +18,186 @@ log = logging.getLogger("ui")
 OUT_DIR = os.environ.get("OUT_DIR", "/opt/content_factory/out")
 Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
-FEATURE_DURATION_SOUND_MENU = int(os.environ.get("FEATURE_DURATION_SOUND_MENU", "1"))
-DEFAULT_DUR = int(os.environ.get("DEFAULT_DURATION", "5"))
+DEFAULT_DURATION = int(os.environ.get("DEFAULT_DURATION", "5"))
+FPS_FINAL = 24
+CUT_START = 0.20
 
 _replicate = None
-_offline = None
-
-I2V_STRICT = True
 
 
 def _ensure_clients():
-    global _replicate, _offline
+    global _replicate
     if _replicate is None:
         _replicate = ReplicateClient()
-    if _offline is None:
-        _offline = OfflineClient(OUT_DIR)
 
 
-def _apply_postprocess(path: str) -> str:
-    """
-    Главный фикс пережжённого старта:
-    — отрезаем первые ~0.2 секунды (5 кадров при 24 fps),
-    — приводим к 720p,
-    — приводим к fps=24.
-    """
+def _postprocess(path: str) -> str:
+    """Убираем пережжённые первые кадры + нормализуем до 24fps / 720p"""
     src = Path(path)
-    final = src.with_suffix(".clean.mp4")
+    final = src.with_suffix(".fx.mp4")
     cmd = (
         f"ffmpeg -y -i {src} "
-        f"-ss 0.20 "
+        f"-ss {CUT_START} "
         f"-vf scale=-2:720:flags=lanczos "
-        f"-r 24 "
+        f"-r {FPS_FINAL} "
         f"-c:v libx264 -preset veryfast -movflags +faststart "
         f"{final}"
     )
     try:
         subprocess.run(cmd, shell=True, check=True)
     except Exception as e:
-        log.error("postprocess failed: %s", e)
+        log.error("postprocess: %s", e)
         return path
     return str(final)
 
 
-def _dur_to_seconds(btn: str) -> int:
-    if btn == "dur5":
-        return 5
-    if btn == "dur10":
-        return 10
-    return DEFAULT_DUR
+async def _generate(prompt: str, seconds: int, image: str | None):
+    """WAN 2.2 генерация (только replicate)"""
+    _ensure_clients()
+    if image:
+        out = _replicate.generate_from_image(image=image, prompt=prompt, seconds=seconds)
+    else:
+        out = _replicate.generate_from_text(prompt=prompt, seconds=seconds)
+    return _postprocess(out)
 
 
-def _sound_flag(btn: str) -> int:
-    return 1 if btn == "sound_on" else 0
-
-
-def _menu_kb():
+def _menu():
     kb = InlineKeyboardMarkup()
     kb.add(
         InlineKeyboardButton("⏱ 5 сек", callback_data="dur5"),
         InlineKeyboardButton("⏱ 10 сек", callback_data="dur10"),
     )
     kb.add(
-        InlineKeyboardButton("🔊 Звук: выкл", callback_data="sound_off"),
-        InlineKeyboardButton("🔊 Звук: вкл", callback_data="sound_on"),
+        InlineKeyboardButton("🔊 звук выкл", callback_data="sound_off"),
+        InlineKeyboardButton("🔊 звук вкл", callback_data="sound_on"),
     )
     kb.add(InlineKeyboardButton("🧩 SORA 2", callback_data="sora2_go"))
     kb.add(InlineKeyboardButton("🔁 Ещё раз", callback_data="again"))
     return kb
 
 
-async def _send_preview(message: types.Message, path: str):
-    try:
-        await message.answer_video(
-            open(path, "rb"),
-            caption="🎬 Предпросмотр готов.",
-        )
-    except Exception as e:
-        log.error("send_preview: %s", e)
-        await message.answer("Ошибка отправки файла.")
-
-
-async def _make_preview(user_id: int, prompt: str, seconds: int, sound: int) -> str:
-    _ensure_clients()
-
+async def _preview(user_id: int, prompt: str, seconds: int, sound: int):
+    """Stub превью (чёрный фон + PREVIEW)"""
     ok, cost, is_free, need = plan_preview(user_id, seconds, sound)
     if not ok:
-        return f"❌ Недостаточно средств. Нужно {cost} ₽, не хватает {need} ₽."
+        return f"❌ Не хватает средств. Нужно {cost} ₽, нехватает {need} ₽."
 
-    # Offline: текстовый фон + шум
-    path = await _offline.generate_video(prompt, seconds)
+    tmp = Path(tempfile.mkdtemp()) / "preview.mp4"
+    cmd = (
+        f"ffmpeg -f lavfi -i color=c=black:s=720x720:d={seconds} "
+        f"-vf drawtext=text='PREVIEW':fontcolor=white:fontsize=64:"
+        f"x=(w-text_w)/2:y=(h-text_h)/2 "
+        f"-c:v libx264 -pix_fmt yuv420p {tmp}"
+    )
+
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+    except Exception as e:
+        log.error("preview fail: %s", e)
+        return "Ошибка предпросмотра."
 
     if not commit_preview_charge(user_id, cost, is_free):
         return "❌ Ошибка списания."
 
-    return path
+    return str(tmp)
 
 
-async def _gen_full(prompt: str, seconds: int, image: str | None = None):
-    _ensure_clients()
-
-    if image:
-        out = _replicate.generate_from_image(
-            image=image,
-            prompt=prompt,
-            seconds=seconds,
-        )
-    else:
-        out = _replicate.generate_from_text(
-            prompt=prompt,
-            seconds=seconds,
-        )
-
-    out = _apply_postprocess(out)
-    return out
+async def _send_preview(message: types.Message, path: str):
+    try:
+        await message.answer_video(open(path, "rb"), caption="🎬 Предпросмотр.")
+    except Exception as e:
+        log.error("send_preview: %s", e)
+        await message.answer("Ошибка отправки.")
 
 
 async def handle_text(message: types.Message, bot_state):
-    user_id = message.from_user.id
-    ensure_user(user_id)
+    user = message.from_user.id
+    ensure_user(user)
 
     prompt = message.text.strip()
-    bot_state["last_prompt"][user_id] = prompt
+    bot_state["last_prompt"][user] = prompt
 
-    await message.answer("🟡 Готовлю предпросмотр…", reply_markup=_menu_kb())
+    await message.answer("🟡 Готовлю предпросмотр…", reply_markup=_menu())
 
-    path = await _make_preview(user_id, prompt, seconds=DEFAULT_DUR, sound=0)
-    if path.endswith(".mp4"):
-        await _send_preview(message, path)
+    prev = await _preview(user, prompt, DEFAULT_DURATION, 0)
+    if prev.endswith(".mp4"):
+        await _send_preview(message, prev)
     else:
-        await message.answer(path)
+        await message.answer(prev)
 
 
 async def handle_photo(message: types.Message, bot_state):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-
-    if not message.photo:
-        await message.answer("Нужна фотография.")
-        return
+    user = message.from_user.id
+    ensure_user(user)
 
     ph = message.photo[-1]
     tmp = Path(tempfile.mkdtemp()) / "img.jpg"
     await ph.download(tmp)
 
-    bot_state["last_image"][user_id] = str(tmp)
-    await message.answer("🟡 Получил фото. Введи описание сцены.", reply_markup=_menu_kb())
+    bot_state["last_image"][user] = str(tmp)
+    await message.answer("🟡 Фото получено. Введи описание сцены.", reply_markup=_menu())
 
 
-async def handle_video(message: types.Message, bot_state):
-    await message.answer("📹 Видео как вход пока не обрабатываю.")
+async def _sora2(message: types.Message, bot_state):
+    user = message.from_user.id
+    ensure_user(user)
 
-
-async def _run_sora2(message: types.Message, bot_state):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-
-    prompt = bot_state["last_prompt"].get(user_id)
+    prompt = bot_state["last_prompt"].get(user)
     if not prompt:
-        await message.answer("Сначала отправь текст.")
+        await message.answer("Сначала текст.")
         return
 
-    img = bot_state["last_image"].get(user_id)
+    img = bot_state["last_image"].get(user)
 
     await message.answer("🧩 Генерирую SORA 2…")
 
-    out = await _gen_full(prompt, seconds=DEFAULT_DUR, image=img)
-    await _send_preview(message, out)
+    try:
+        out = await _generate(prompt, DEFAULT_DURATION, img)
+        await _send_preview(message, out)
+    except Exception as e:
+        log.error("sora2: %s", e)
+        await message.answer("Ошибка генерации.")
 
 
 async def handle_callback(query: types.CallbackQuery, bot_state):
-    user_id = query.from_user.id
-    ensure_user(user_id)
+    user = query.from_user.id
+    ensure_user(user)
 
     data = query.data or ""
 
     try:
         if data == "again":
             await query.answer()
-            msg = query.message
-            prompt = bot_state["last_prompt"].get(user_id)
-            img = bot_state["last_image"].get(user_id)
+            prompt = bot_state["last_prompt"].get(user)
+            img = bot_state["last_image"].get(user)
             if not prompt:
-                await msg.answer("Сначала напиши текст.")
+                await query.message.answer("Сначала текст.")
                 return
-            await msg.answer("🔁 Генерирую снова…")
-            out = await _gen_full(prompt, DEFAULT_DUR, image=img)
-            await _send_preview(msg, out)
+            await query.message.answer("🔁 Генерирую…")
+            out = await _generate(prompt, DEFAULT_DURATION, img)
+            await _send_preview(query.message, out)
             return
 
         if data == "sora2_go":
             await query.answer()
-            await _run_sora2(query.message, bot_state)
+            await _sora2(query.message, bot_state)
             return
 
         if data.startswith("dur"):
-            await query.answer("⏱ Выбрана длительность")
-            bot_state["last_dur"] = data
+            await query.answer("⏱ длительность выбрана")
+            bot_state.setdefault("last_dur", {})[user] = data
             return
 
         if data.startswith("sound_"):
-            await query.answer("🔊 Звук переключён")
-            bot_state["last_sound"] = data
+            await query.answer("🔊 звук переключён")
+            bot_state.setdefault("last_sound", {})[user] = data
             return
 
     except InvalidQueryID:
         pass
     except Exception as e:
-        log.error("callback error: %s", e)
+        log.error("callback: %s", e)
         try:
-            await query.message.answer("Ошибка обработки кнопки.")
-        except Exception:
+            await query.message.answer("Ошибка кнопки.")
+        except:
             pass
